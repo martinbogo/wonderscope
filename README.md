@@ -21,14 +21,20 @@ Web dashboard served by the board, plus a text console on USB serial and in the 
 
 ## Build and flash
 
-Run from PowerShell (Espressif's tool installer rejects Git Bash / MSYS):
+Requires [PlatformIO Core](https://platformio.org/install/cli) and GNU Make. On Windows, recipes use Git for Windows' shell.
 
-```powershell
-pio run -e wonderscope -t upload --upload-port COM13
-```
+| Command | Action |
+|---|---|
+| `make flash` | Build and install over USB |
+| `make ota` | Build and install over Wi-Fi |
+| `make monitor` | Serial console |
+| `make backup` | Save the complete flash to `backup/` |
+| `make restore IMAGE=file.bin` | Write a full flash image |
+| `make` | List all targets |
 
-The dashboard (`web/`) is gzipped into the firmware at build time by `tools/embed_web.py`.
-Subsequent updates can be uploaded from Settings → Firmware (`.pio/build/wonderscope/firmware.bin`).
+Defaults are in `mk/config.mk`: serial port auto-detected, host `wonderscope.local`. Override per command (`make flash PORT=COM13`) or in `local.mk` (see `local.mk.example`).
+
+Release binaries: `firmware.bin` for OTA (Settings → Firmware, or `make ota`), `firmware.factory.bin` for a complete USB install at offset 0.
 
 ## Hardware notes
 

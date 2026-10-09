@@ -3,6 +3,8 @@
 src/generated/
 
 # Local tooling
+local.mk
+compile_commands.json
 .claude/
 .vscode/
 

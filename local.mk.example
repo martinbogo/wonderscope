@@ -1,0 +1,4 @@
+# Copy to local.mk for per-machine settings (local.mk is not tracked).
+# PORT := COM13
+# HOST := 192.168.0.106
+# AUTH := admin:secret
