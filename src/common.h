@@ -5,7 +5,7 @@
 #include <ArduinoJson.h>
 
 #define FW_NAME "WonderScope"
-#define FW_VERSION "1.0.1"
+#define FW_VERSION "1.1.0"
 
 namespace pins {
 constexpr int RS485_TX = 17;
