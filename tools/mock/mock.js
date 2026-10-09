@@ -165,8 +165,18 @@ class MockWS {
     if (c === 'cli') {
       const l = m.line.trim();
       let text = `(mock) ${l}`;
-      if (l === 'help') text = 'WonderScope console - every dashboard feature is available here.\n\nGeneral:\n  help           List commands\n  status         Bus, Wi-Fi and system status\n(mock: full help comes from the firmware)';
-      if (l === 'status') text = 'WonderScope up 61s  heap 197k\nRS485  ON   9600 8N1\nCAN    ON   250 kbit/s  listen-only  state running';
+      if (l === 'help') text = HELP;
+      if (l === 'status') text = `WonderScope up ${Math.round(up() / 1000)}s  heap 186k  psram 7030k  web clients 1  devices ${devs.size}\nTime   ${new Date().toISOString().replace('T', ' ').slice(0, 19)} UTC\nWi-Fi  AP "WonderScope-0C78" 192.168.4.1 (0 clients)\n       STA "Workshop" 192.168.0.106  RSSI -52 dBm  http://wonderscope.local/\nRS485  ON   9600 8N1  timeout 200ms  rx ${counters.rs485.rx}  tx ${counters.rs485.tx}  err 0\nCAN    ON   250 kbit/s  listen-only  state running  TEC 0 REC 0  rx ${counters.can.rx}  tx 0  busErr 0  ids ${ids.size}`;
+      if (l === 'devices') {
+        text = 'KEY                LABEL                STATUS            LAST SEEN  IDENTITY\n' + [...devs.values()].map(d => {
+          const st = d.consecErr >= 3 ? 'not responding' : d.passive ? 'online (passive)' : 'online';
+          const ident = [d.vendor, d.product, d.name].filter(Boolean).join(' ');
+          return `${d.key.padEnd(18)} ${(d.label || '').slice(0, 20).padEnd(20)} ${st.padEnd(17)} ${(d.consecErr >= 3 ? '58m ago' : '0s ago').padEnd(10)} ${ident}`;
+        }).join('\n');
+      }
+      if (l === 'mb read 1 ir 0 4') text = 'reg     hex      unsigned  signed\n0       0x4365   17253     17253\n1       0x8A3D   35389     -30147\n2       0x4366   17254     17254\n3       0x0F5C   3932      3932';
+      if (l === 'sdo read 5 1018:1') text = 'node 5  0x1018:1  = 0x000002DE  (734)  [4 bytes]';
+      if (l === 'sdo read 5 1008') text = 'node 5  0x1008:0  = "CANopen IO 16DI"  [15 bytes] 43414E6F70656E20494F2031364449';
       if (l.startsWith('trace')) { text = l.includes('off') ? 'Live trace off.' : 'Live trace ON (all buses) - \'trace off\' to stop.'; }
       if (l === 'bogus') text = "Unknown command 'bogus'. Type 'help' for the list.";
       return setTimeout(() => this.emit({ ev: 'cli', id: m.id, text }), 60);
@@ -174,6 +184,48 @@ class MockWS {
     err(`unknown command '${c}'`);
   }
 }
+const HELP = `WonderScope console. All dashboard functions are available as commands.
+'help <command>' shows usage and examples.
+
+General:
+  help           List commands, or show details for one
+  status         Bus, Wi-Fi and system status
+  info           Firmware and board information
+  clear          Clear the screen
+
+Bus control:
+  rs485          Show or configure the RS485 port
+  can            Show or configure the CAN port
+
+Discovery:
+  scan           Discover devices on a bus
+  devices        List discovered devices
+  dev            Inspect or edit one device
+  ids            Table of every CAN identifier seen (count, rate, last data)
+
+Modbus RTU (RS485):
+  mb             Modbus RTU master requests
+
+CANopen:
+  sdo            CANopen SDO read/write
+  nmt            Send a CANopen NMT command
+  co             Read a CANopen node's identity objects
+
+J1939:
+  j1939          J1939 requests and messages
+
+Raw frames:
+  cansend        Send a raw CAN frame (can-utils syntax)
+  rs485send      Send raw bytes on RS485 (no CRC unless 'crc')
+  trace          Stream live bus frames to this console
+
+System:
+  wifi           Show or change Wi-Fi
+  auth           Require a login for the web dashboard
+  time           Show or set the clock
+  reboot         Restart the board
+  factory-reset  Erase all settings and the device list`;
+
 function idsJson() {
   return [...ids.values()].map(e => [e.id, e.ext ? 1 : 0, e.dlc, e.count, 10, up() - e.last, e.data, 0]);
 }

@@ -384,6 +384,7 @@ function onMessage(m) {
 
 async function onHello(d) {
   S.hello = d;
+  renderConn();
   onStatus(d.status);
   renderSettings();
   try { await call('time.set', { epoch: Date.now() }); } catch (e) { /* not critical */ }
@@ -508,7 +509,9 @@ const devsOn = bus => [...S.devices.values()].filter(d => d.bus === bus).sort((a
 function renderConn() {
   const c = $('#conn');
   c.className = 'conn ' + (S.connected ? 'ok' : 'bad');
-  $('#connText').textContent = S.connected ? (location.host || 'connected') : 'Disconnected';
+  const name = S.hello && S.hello.settings.wifi.hostname ? S.hello.settings.wifi.hostname + '.local' : location.host;
+  $('#connText').textContent = S.connected ? (name || 'connected') : 'Disconnected';
+  c.title = S.connected ? `Connected via ${location.host}` : 'Not connected';
   $('#offline').hidden = S.connected;
 }
 function renderHeader() {
@@ -545,8 +548,8 @@ const THEMES = ['auto', 'light', 'dark'];
 function applyTheme(t) {
   if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t;
   else delete document.documentElement.dataset.theme;
-  store('theme', t);
-  try { localStorage.setItem('bs.theme', t); } catch (e) { /* ignore */ }
+  // Stored raw (not JSON): index.html reads it before first paint.
+  try { localStorage.setItem('bs.theme', t); } catch (e) { /* storage unavailable */ }
   $('#themeBtn').title = 'Theme: ' + t + ' (click to change)';
   const sel = $('#themeSelect'); if (sel) sel.value = t;
 }
@@ -674,10 +677,10 @@ function renderTopology(bus) {
   kids.push(sv('path', { class: 'trunk', d }));
   const endX = rows % 2 ? xr : xl, endY = trunkY(rows - 1);
   // terminators
-  const term = (x, y, label, anchor) => [
+  const term = (x, y, label) => [
     sv('rect', { class: 'term', x: x - 7, y: y - 13, width: 14, height: 26, rx: 2 }),
-    sv('text', { class: 'term-label', x: x + (anchor === 'end' ? -12 : 12), y: y + 4, 'text-anchor': anchor }, label)];
-  kids.push(...term(endX, endY, '120 Ω', rows % 2 ? 'end' : 'start'));
+    sv('text', { class: 'term-label', x, y: y - 19, 'text-anchor': 'middle' }, label)];
+  kids.push(...term(endX, endY, '120 Ω'));
   // gateway
   const gy = trunkY(0) - gwH / 2;
   const sub1 = bus === 'rs485' ? (c.enabled ? `${c.baud} 8${c.parity}${c.stop}` : 'disabled') : (c.enabled ? `${kbit(c.bitrate || 0)}bit/s` : 'disabled');
@@ -1849,7 +1852,9 @@ function otaUpload(input, bar) {
 // Boot
 // =====================================================================
 function init() {
-  applyTheme(store('theme') || 'auto');
+  let savedTheme = 'auto';
+  try { savedTheme = localStorage.getItem('bs.theme') || 'auto'; } catch (e) { /* storage unavailable */ }
+  applyTheme(THEMES.includes(savedTheme) ? savedTheme : 'auto');
   $('#themeBtn').addEventListener('click', () => applyTheme(THEMES[(THEMES.indexOf(currentTheme()) + 1) % 3]));
   $$('.tabs button').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
   document.addEventListener('change', e => {

@@ -1,5 +1,8 @@
 <!doctype html>
-<!-- Dashboard with a simulated backend: serve the project root and open /tools/mock/ -->
+<!-- Dashboard with a simulated backend: serve the project root and open /tools/mock/
+     Query parameters (for screenshots):
+       view=map|grid|traffic|ids|console|settings  theme=light|dark
+       open=<device key>  tab=<panel tab label>  cmds=<console commands, ';'-separated> -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -11,6 +14,36 @@
 </head>
 <body>
 <script>
+  const q = new URLSearchParams(location.search);
+  try {
+    if (q.get('view')) localStorage.setItem('bs.view', JSON.stringify(q.get('view')));
+    if (q.get('theme')) localStorage.setItem('bs.theme', q.get('theme'));
+  } catch (e) {}
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  async function script() {
+    await sleep(1200);
+    const key = q.get('open');
+    if (key) {
+      const find = () => [...document.querySelectorAll('g.node')].find(g => (g.querySelector('title') || {}).textContent?.startsWith(key + '\n'));
+      let node;
+      for (let i = 0; i < 40 && !(node = find()); i++) {
+        window.dispatchEvent(new Event('resize'));  // forces a synchronous map layout
+        await sleep(250);
+      }
+      if (node) node.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+      await sleep(400);
+      const tab = q.get('tab');
+      if (tab) { const b = [...document.querySelectorAll('.dtabs button')].find(b => b.textContent === tab); if (b) b.click(); }
+    }
+    const cmds = q.get('cmds');
+    if (cmds) {
+      const inp = document.querySelector('.term-input input');
+      for (const c of cmds.split(';')) {
+        inp.value = c; inp.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', bubbles: true }));
+        await sleep(300);
+      }
+    }
+  }
   // Pull in the real dashboard markup so the mock always matches the firmware's page.
   fetch('../../web/index.html').then(r => r.text()).then(html => {
     const doc = new DOMParser().parseFromString(html, 'text/html');
@@ -18,7 +51,9 @@
     document.body.innerHTML = doc.body.innerHTML;
     try { const t = localStorage.getItem('bs.theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
     document.querySelector('link[rel=stylesheet]').href = '../../web/style.css?' + Date.now();
-    const s = document.createElement('script'); s.src = '../../web/app.js?' + Date.now(); document.body.append(s);
+    const s = document.createElement('script'); s.src = '../../web/app.js?' + Date.now();
+    s.onload = script;
+    document.body.append(s);
   });
 </script>
 </body>

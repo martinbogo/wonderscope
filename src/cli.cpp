@@ -1153,7 +1153,7 @@ String cli_render(const char *cmd, JsonDocument &doc) {
     JsonArrayConst ds = o["devices"];
     uint32_t now = o["now"] | 0;
     if (!ds.size()) return "No devices. Discover with: scan rs485 | scan canopen | scan j1939";
-    String s = "KEY                LABEL                STATUS          LAST SEEN  IDENTITY\n";
+    String s = "KEY                LABEL                STATUS            LAST SEEN  IDENTITY\n";
     for (JsonObjectConst d : ds) {
       int consec = d["consecErr"] | 0;
       const char *st = consec >= 3 ? "not responding" : (d["present"] | false) ? ((d["passive"] | false) ? "online (passive)" : "online")
@@ -1161,7 +1161,7 @@ String cli_render(const char *cmd, JsonDocument &doc) {
       String ident = String((const char *)(d["vendor"] | "")) + " " + (const char *)(d["product"] | "") + " " +
                      (const char *)(d["name"] | "");
       ident.trim();
-      snprintf(b, sizeof(b), "%-18s %-20.20s %-15s %-10s %s\n", (const char *)(d["key"] | ""),
+      snprintf(b, sizeof(b), "%-18s %-20.20s %-17s %-10s %s\n", (const char *)(d["key"] | ""),
                (const char *)(d["label"] | ""), st, fmt_age(now, d["lastSeen"] | 0).c_str(), ident.c_str());
       s += b;
     }
