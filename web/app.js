@@ -100,7 +100,16 @@ function modal(title, body, buttons) {
       finish(v);
     };
     dlg.oncancel = () => finish('cancel');
-    dlg.onclose = () => finish(dlg.returnValue || 'cancel');
+    // The close event of a previous modal is delivered asynchronously and can
+    // arrive after this one opened; ignore it while a dialog is showing.
+    dlg.onclose = () => { if (!dlg.open) finish(dlg.returnValue || 'cancel'); };
+    // Enter in a field runs the main action (last button), not Cancel.
+    form.onkeydown = e => {
+      if (e.key !== 'Enter' || !e.target.matches('input, select')) return;
+      e.preventDefault();
+      const main = form.querySelector('.mf button:last-child');
+      if (main) main.click();
+    };
     dlg.returnValue = '';
     dlg.showModal();
     const first = form.querySelector('input,select,textarea');
@@ -183,7 +192,7 @@ function decodePgnData(pgn, d) {
       case 65263: return NA(d[3]) ? '' : `oil pressure ${d[3] * 4} kPa`;
       case 65271: return NA(u16(6)) ? '' : `battery ${(u16(6) * 0.05).toFixed(2)} V`;
       case 65269: return NA(u16(3)) ? '' : `ambient ${(u16(3) * 0.03125 - 273).toFixed(1)} °C`;
-      case 65253: { const v = d[0] | d[1] << 8 | d[2] << 16 | (d[3] << 24) >>> 0; return v === 0xffffffff ? '' : `${(v * 0.05).toFixed(1)} h`; }
+      case 65253: { const v = (d[0] | d[1] << 8 | d[2] << 16 | d[3] << 24) >>> 0; return v === 0xffffffff ? '' : `${(v * 0.05).toFixed(1)} h`; }
       case 65266: return NA(u16(0)) ? '' : `fuel rate ${(u16(0) * 0.05).toFixed(2)} L/h`;
       case 65226: case 65227: {
         if (d.length < 6) return '';
@@ -364,17 +373,23 @@ function connect() {
   let ws;
   try { ws = new WebSocket(url); } catch (e) { setTimeout(connect, 2000); return; }
   RPC.ws = ws;
-  ws.onopen = () => { S.connected = true; RPC.backoff = 500; renderConn(); };
+  ws.onopen = () => { S.connected = true; RPC.backoff = 500; RPC.lastMsgAt = performance.now(); renderConn(); };
   ws.onclose = () => {
     const was = S.connected;
     S.connected = false; renderConn();
     for (const p of RPC.pending.values()) p.reject(new Error('connection lost'));
+    if (Console.built) Console.disconnected();
     RPC.pending.clear();
     setTimeout(connect, was ? 300 : RPC.backoff);
     RPC.backoff = Math.min(RPC.backoff * 2, 5000);
   };
-  ws.onmessage = e => { let m; try { m = JSON.parse(e.data); } catch (x) { return; } onMessage(m); };
+  ws.onmessage = e => { RPC.lastMsgAt = performance.now(); let m; try { m = JSON.parse(e.data); } catch (x) { return; } onMessage(m); };
 }
+// Status arrives every second; a silent socket is half-open (board rebooted,
+// Wi-Fi changed) and is replaced.
+setInterval(() => {
+  if (S.connected && RPC.ws && performance.now() - (RPC.lastMsgAt || 0) > 6000) RPC.ws.close();
+}, 2000);
 
 function call(cmd, args = {}, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
@@ -400,7 +415,7 @@ function onMessage(m) {
     case 'state': onStatus(m.s); onSettings(m.settings); break;
     case 'dev': onDevices(m.d, m.now); break;
     case 'devdel': for (const k of m.keys) { S.devices.delete(k); if (S.selected === k) closeDrawer(); } scheduleRender(); break;
-    case 'devclear': for (const [k, d] of S.devices) if (!m.bus || d.bus === m.bus) S.devices.delete(k); scheduleRender(); break;
+    case 'devclear': for (const [k, d] of S.devices) if (!m.bus || d.bus === m.bus) S.devices.delete(k); if (S.selected && !S.devices.has(S.selected)) closeDrawer(); scheduleRender(); break;
     case 'devreload': loadDevices(); break;
     case 'tr': onTrace(m); break;
     case 'ids': onIds(m.ids); break;
@@ -459,18 +474,37 @@ function refreshBusViews(prevMode) {
   renderHeader(); renderStatusbar(); renderBusHeads(); syncForms();
   const dc = $('#setDevCount');
   if (dc) dc.textContent = `${S.devices.size} device${S.devices.size === 1 ? '' : 's'}`;
+  const wl = $('#setWifiLine');
+  if (wl) wl.textContent = wifiLine(S.status);
+  const ck = $('#setClock');
+  if (ck) ck.textContent = clockText(S.status);
   if (S.view === 'grid') renderGrid();
   if (S.view === 'map') scheduleRender();
   if (S.selected) {
-    if (prevMode !== undefined && prevMode !== busCfg('can').mode) renderDrawer();
+    // Rebuild the drawer when configuration it displays changed (CAN mode gates
+    // controls; SPI read bit and RS485 link appear in hints/defaults), unless the
+    // user is typing in it.
+    const sig = drawerSig();
+    const editing = $('#drawer').contains(document.activeElement) && document.activeElement.matches('input, select, textarea');
+    if (sig !== S.drawerSig && !editing) renderDrawer();
     else updateDrawerLive();
   }
 }
+const drawerSig = () => [busCfg('can').mode, busCfg('spi').readBit, busCfg('rs485').baud, busCfg('rs485').parity, busCfg('rs485').stop].join('|');
 function onSettings(st) {
   if (!S.hello || !st) return;
   S.hello.settings = st;
   syncForms();
+  // Rebuild derived text (login state, placeholders, hints) unless the user is editing.
+  if (S.view === 'settings' && !settingsEditing()) renderSettings();
 }
+function settingsEditing() {
+  const v = $('#view-settings');
+  return !!(v && (v.querySelector('[data-dirty]') || (v.contains(document.activeElement) && document.activeElement.matches('input, select, textarea'))));
+}
+const wifiLine = s => !s || !s.wifi ? '' :
+  `AP ${s.wifi.ap.ip} · ${s.wifi.sta.connected ? `joined "${s.wifi.sta.ssid}" as ${s.wifi.sta.ip}` : s.wifi.sta.ssid ? `not connected to "${s.wifi.sta.ssid}"` : 'not joined to a network'}`;
+const clockText = s => s && s.epoch ? new Date(s.epoch).toLocaleString() + (s.wifi && s.wifi.ntp ? ' (NTP)' : ' (from browser)') : 'not set';
 function blink(bus, rx, err) {
   const led = $('#led-' + bus);
   if (!led) return;
@@ -485,15 +519,19 @@ function onDevices(list, now) {
     if (prev && d.rx > prev.rx) S.pulse.add(d.key);
     if (d.watch) recordWatchHistory(d);
     recordValueHistory(d);
-    S.devices.set(d.key, Object.assign(prev || {}, d));
+    // Pushes carry the full device; replace so fields the firmware omits
+    // (cleared driver, values, errors) do not linger.
+    S.devices.set(d.key, d);
   }
   scheduleRender();
   if (S.selected && list.some(d => d.key === S.selected)) updateDrawerLive();
 }
+// History keyed by what is watched, not list position (survives removals).
+const watchKey = (d, w) => `${d.key}|w|${w.fn}:${w.addr}:${w.sub}:${w.count}:${w.fmt}`;
 function recordWatchHistory(d) {
   d.watch.forEach((w, i) => {
     if (!w.ts || w.err) return;
-    const k = d.key + '|' + i;
+    const k = watchKey(d, w);
     const hist = S.watchHist.get(k) || [];
     if (hist.length && hist[hist.length - 1].ts === w.ts) return;
     const v = decodeValue(w.fmt, hexBytes(w.raw), d.proto, w.fn);
@@ -547,7 +585,7 @@ function devName(d) {
   return { modbus: 'Modbus device', canopen: 'CANopen node', j1939: 'J1939 ECU', i2c: 'I²C device', spi: 'SPI device' }[d.proto] || 'Device';
 }
 function valuesSummary(d, max = 2) {
-  return (d.values || []).slice(0, max).map(v => `${v.v.toFixed(Math.abs(v.v) >= 100 ? 1 : 2)} ${v.u}`).join(' · ');
+  return (d.values || []).filter(v => Number.isFinite(v.v)).slice(0, max).map(v => `${v.v.toFixed(Math.abs(v.v) >= 100 ? 1 : 2)} ${v.u}`).join(' · ');
 }
 function devSub(d) {
   const st = devStatus(d);
@@ -621,7 +659,7 @@ function currentTheme() { const t = document.documentElement.dataset.theme; retu
 // =====================================================================
 function setView(v) {
   S.view = v;
-  $$('.tabs button').forEach(b => b.classList.toggle('active', b.dataset.view === v));
+  $$('.tabs button').forEach(b => { b.classList.toggle('active', b.dataset.view === v); b.setAttribute('aria-selected', String(b.dataset.view === v)); });
   $$('.view').forEach(s => s.classList.toggle('active', s.id === 'view-' + v));
   store('view', v);
   subscribe();
@@ -654,7 +692,7 @@ const BUS_INFO = {
   spi: { title: 'SPI', protos: 'pin header · SCK IO12 · MOSI IO11 · MISO IO13', short: 'SPI' },
 };
 const WIRING_HINT = {
-  qwiic: 'Enable to scan the Qwiic connector. Devices are detected automatically when plugged in.',
+  qwiic: 'Enable to scan the Qwiic connector. With auto-detect on, devices appear when plugged in.',
   i2c: 'Disabled. Connect SDA to IO8 and SCL to IO9 on the internal pin header (with 3V3 and GND), then enable.',
   spi: 'Disabled. Connect SCK to IO12, MOSI to IO11, MISO to IO13 and CS to IO10 on the internal pin header, then enable.',
 };
@@ -668,7 +706,7 @@ function buildMapSkeleton() {
     v.append(h('div', { class: 'card bus-card' + (xb ? ' xbus' : ''), 'data-bus': bus, id: 'buscard-' + bus },
       h('div', { class: 'card-head' },
         h('label', { class: 'switch', title: `Enable / disable ${BUS_INFO[bus].title}` },
-          h('input', { type: 'checkbox', 'data-act': 'toggle-bus', 'data-bus': bus }), h('span')),
+          h('input', { type: 'checkbox', 'data-act': 'toggle-bus', 'data-bus': bus, 'aria-label': `Enable ${BUS_INFO[bus].title}` }), h('span')),
         h('h2', null, BUS_INFO[bus].title, h('span', { class: 'muted', style: { fontWeight: 400 } }, ' · ' + BUS_INFO[bus].protos)),
         h('span', { class: 'meta', id: 'busmeta-' + bus }),
         h('span', { class: 'spacer' }),
@@ -724,6 +762,7 @@ function renderMap() {
   S.pulse.clear();
 }
 
+const keyActivate = fn => e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(); } };
 function truncate(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1) + '…' : s; }
 
 function renderTopology(bus) {
@@ -791,7 +830,7 @@ function renderTopology(bus) {
     kids.push(sv('line', { class: 'drop', x1: cx, y1: above ? y + cardH : y, x2: cx, y2: ty }));
     kids.push(sv('circle', { cx, cy: ty, r: 3.5, class: 'trunk', style: 'fill: var(--surface); stroke-width: 2' }));
     if (it.ghost) {
-      kids.push(sv('g', { class: 'ghost', transform: `translate(${x} ${y})`, tabindex: 0, role: 'button', onclick: () => scanDialog(bus) },
+      kids.push(sv('g', { class: 'ghost', transform: `translate(${x} ${y})`, tabindex: 0, role: 'button', 'aria-label': `Scan ${BUS_INFO[bus].title}`, 'data-key': 'ghost-' + bus, onclick: () => scanDialog(bus), onkeydown: keyActivate(() => scanDialog(bus)) },
         sv('rect', { width: cardW, height: cardH, rx: 8 }),
         sv('text', { x: cardW / 2, y: cardH / 2 - 2, 'text-anchor': 'middle' }, devs.length ? '+ Scan' : 'No devices'),
         sv('text', { x: cardW / 2, y: cardH / 2 + 14, 'text-anchor': 'middle', style: 'font-size:11px' },
@@ -799,7 +838,7 @@ function renderTopology(bus) {
       return;
     }
     if (it.ids) {
-      kids.push(sv('g', { class: 'ghost', transform: `translate(${x} ${y})`, tabindex: 0, role: 'button', onclick: () => setView('ids') },
+      kids.push(sv('g', { class: 'ghost', transform: `translate(${x} ${y})`, tabindex: 0, role: 'button', 'aria-label': 'Open CAN ID map', 'data-key': 'ghost-ids', onclick: () => setView('ids'), onkeydown: keyActivate(() => setView('ids')) },
         sv('rect', { width: cardW, height: cardH, rx: 8 }),
         sv('text', { x: cardW / 2, y: cardH / 2 - 2, 'text-anchor': 'middle', style: 'fill: var(--text)' }, `${it.ids} CAN ID${it.ids === 1 ? '' : 's'} seen`),
         sv('text', { x: cardW / 2, y: cardH / 2 + 14, 'text-anchor': 'middle', style: 'font-size:11px' }, 'View ID map')));
@@ -810,7 +849,7 @@ function renderTopology(bus) {
     const cls = `node ${st}${S.selected === dv.key ? ' selected' : ''}`;
     kids.push(sv('g', {
       class: cls, transform: `translate(${x} ${y})`, tabindex: 0, role: 'button', 'aria-label': `${devName(dv)} ${STATUS_TEXT[st]}`,
-      onclick: () => openDevice(dv.key), onkeydown: e => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openDevice(dv.key); } },
+      'data-key': dv.key, onclick: () => openDevice(dv.key), onkeydown: keyActivate(() => openDevice(dv.key)),
     },
       sv('title', null, `${dv.key}\n${devName(dv)}\n${STATUS_TEXT[st]}`),
       sv('rect', { class: 'box', width: cardW, height: cardH, rx: 8 }),
@@ -822,7 +861,10 @@ function renderTopology(bus) {
       sv('circle', { class: 'act' + (S.pulse.has(dv.key) ? ' on' : ''), cx: cardW - 10, cy: cardH - 10, r: 3.5 }),
       dv.emcy && serverNow() - dv.emcy.ts < 60000 ? sv('text', { x: cardW - 10, y: 20, 'text-anchor': 'end', style: 'fill: var(--err); font-weight:700; font-size: 11px' }, 'EMCY') : null));
   });
+  // Re-rendering replaces every node; keep keyboard focus on the same item.
+  const focusKey = svg.contains(document.activeElement) ? document.activeElement.getAttribute('data-key') : null;
   svg.replaceChildren(...kids);
+  if (focusKey) { const el = svg.querySelector(`[data-key="${CSS.escape(focusKey)}"]`); if (el) el.focus(); }
 }
 
 // =====================================================================
@@ -1101,7 +1143,7 @@ async function scanDialogCan() {
   };
   kind.addEventListener('change', sync); sync();
   const r = await modal('Scan the CAN bus', [h('label', { class: 'field' }, h('span', null, 'Action'), kind), coOpts, jOpts, warn,
-    h('p', { class: 'hint' }, 'Passive discovery (CANopen heartbeat, J1939 traffic) runs continuously.')],
+    h('p', { class: 'hint' }, 'Passive discovery (CANopen heartbeat, J1939 traffic) runs whenever it is enabled in Settings.')],
   [{ label: 'Cancel', value: 'cancel' }, { label: 'Start', value: 'go', cls: 'primary' }]);
   if (r !== 'go') return;
   if (kind.value === 'autobaud') return autobaud();
@@ -1137,14 +1179,17 @@ async function toggleBus(bus, on) {
     toast(`${BUS_INFO[bus].title} ${on ? 'enabled' : 'disabled'}`);
   } catch (e) { fail(e); }
 }
+// Confirmation only; callers send one can.config with the final bitrate and mode
+// so the board never goes active at a stale bitrate.
+async function confirmActive(bitrate) {
+  const ok = await confirmBox('Switch CAN to active mode?',
+    h('div', { class: 'stack' }, h('p', { style: { margin: 0 } }, 'Active mode acknowledges frames and permits transmission (scans, SDO, NMT, J1939 requests, raw frames).'),
+      h('div', { class: 'warnbox' }, `Bitrate: ${kbit(bitrate)}bit/s. A mismatch generates error frames on the bus.`)),
+    'Switch to active');
+  if (!ok) throw new Error('Cancelled');
+}
 async function setCanMode(mode) {
-  if (mode === 'normal' && !canActive()) {
-    const ok = await confirmBox('Switch CAN to active mode?',
-      h('div', { class: 'stack' }, h('p', { style: { margin: 0 } }, 'Active mode acknowledges frames and permits transmission (scans, SDO, NMT, J1939 requests, raw frames).'),
-        h('div', { class: 'warnbox' }, `Configured bitrate: ${kbit(busCfg('can').bitrate)}bit/s. A mismatch generates error frames on the bus.`)),
-      'Switch to active');
-    if (!ok) throw new Error('Cancelled');
-  }
+  if (mode === 'normal' && !canActive()) await confirmActive(busCfg('can').bitrate);
   const r = await call('can.config', { mode });
   applyBusStatus('can', r);
 }
@@ -1208,8 +1253,8 @@ async function busConfigDialog(bus) {
     if (r === 'auto') return autobaud();
     if (r !== 'ok') return;
     try {
-      if (mode.value === 'normal' && c.mode !== 'normal') await setCanMode('normal');
-      await call('can.config', { bitrate: +br.value, mode: mode.value });
+      if (mode.value === 'normal' && c.mode !== 'normal') await confirmActive(+br.value);
+      applyBusStatus('can', await call('can.config', { bitrate: +br.value, mode: mode.value }));
       toast('CAN settings applied', 'ok');
     } catch (e) { if (e.message !== 'Cancelled') fail(e); }
   }
@@ -1241,15 +1286,27 @@ async function refreshSelected() {
   try {
     const full = await call('dev.get', { key });
     if (S.selected !== key) return;
-    S.devices.set(key, Object.assign(S.devices.get(key) || {}, full));
+    S.devices.set(key, full);
     if (full.watch) recordWatchHistory(full);
     recordValueHistory(full);
-    updateDrawerLive();
+    // The drawer may have been built from a dev.list summary (no notes / watch list).
+    if (!S.drawerFull) renderDrawer();
+    else updateDrawerLive();
   } catch (e) { /* device may have been removed */ }
+}
+
+// dev.list returns summaries; notes and watch lists exist only in full objects.
+const isFull = d => d && 'notes' in d && 'watch' in d;
+function needFull(key) {
+  if (isFull(S.devices.get(key))) return true;
+  toast('Device details are still loading', 'err');
+  return false;
 }
 
 function renderDrawer() {
   const d = S.devices.get(S.selected); if (!d) return closeDrawer();
+  S.drawerFull = isFull(d);
+  S.drawerSig = drawerSig();
   const tabs = [['overview', 'Overview']];
   if (d.proto === 'modbus') tabs.push(['regs', 'Registers'], ['watch', 'Watch']);
   if (d.proto === 'canopen') tabs.push(['objects', 'Objects & NMT'], ['watch', 'Watch']);
@@ -1346,7 +1403,7 @@ function drawerOverview(d) {
         h('button', { class: 'btn small', onclick: async () => { try { await call('dev.update', { key: d.key, baud: +baud.value, parity: parity.value, stop: +stop.value }); toast('Saved', 'ok', 1200); } catch (e) { fail(e); } } }, 'Save')),
       h('p', { class: 'hint' }, 'Link settings used for requests to this device. The device itself is not reconfigured.')));
   }
-  const notes = h('textarea', { placeholder: 'Location, wiring, purpose…' }, d.notes || '');
+  const notes = h('textarea', { placeholder: isFull(d) ? 'Location, wiring, purpose…' : 'Loading…', disabled: !isFull(d) }, d.notes || '');
   out.push(h('div', { class: 'dsec' }, h('h4', null, 'Notes'), notes,
     h('div', { class: 'row', style: { marginTop: '6px' } }, h('button', { class: 'btn small', onclick: async () => { try { await call('dev.update', { key: d.key, notes: notes.value }); toast('Notes saved', 'ok', 1200); } catch (e) { fail(e); } } }, 'Save notes'))));
   const actions = h('div', { class: 'row' });
@@ -1434,7 +1491,8 @@ function drawerRegisters(d) {
 function addWatchBtn(d, fn, addr, count, fmt) {
   return h('button', { class: 'btn small ghost', title: 'Add to watch list', onclick: async () => {
     const full = S.devices.get(d.key);
-    const watch = (full.watch || []).map(stripWatch);
+    if (!needFull(d.key)) return;
+    const watch = full.watch.map(stripWatch);
     if (watch.length >= 16) return toast('Watch list is full (16 items)', 'err');
     watch.push({ name: `${fn <= 2 ? (fn === 1 ? 'coil' : 'input') : (fn === 3 ? 'hr' : 'ir')} ${addr}`, fn, addr, count, fmt, scale: 1, unit: '' });
     try { await call('dev.update', { key: d.key, watch, pollMs: full.pollMs || 1000 }); toast('Added to watch list (polling every ' + ((full.pollMs || 1000) / 1000) + ' s)', 'ok'); refreshSelected(); } catch (e) { fail(e); }
@@ -1612,7 +1670,7 @@ function renderValues(d, tbody) {
   }
   tbody.replaceChildren(...vals.map(v => {
     const hk = `${d.key}|v|${v.n}`;
-    return h('tr', null, h('td', null, v.n), h('td', { class: 'mono' }, h('span', { class: 'val-big' }, fmtValue(+v.v.toPrecision(6), 1, v.u))),
+    return h('tr', null, h('td', null, v.n), h('td', { class: 'mono' }, h('span', { class: 'val-big' }, Number.isFinite(v.v) ? fmtValue(+v.v.toPrecision(6), 1, v.u) : '—')),
       h('td', null, chartSpark(hk, `${devName(d)} ${v.n}`, v.u)));
   }));
 }
@@ -1693,7 +1751,7 @@ function drawerI2cRegs(d) {
         try {
           const r = parseNum(wreg.value); if (isNaN(r)) throw new Error('Register required');
           if (!await confirmBox(`Write to ${devName(d)}?`, `${hexAddr(d.addr)} register ${hexAddr(r)} ← ${wdata.value}`, 'Write')) return;
-          await call('i2c.write', { bus: d.bus, addr: d.addr, reg: r, regBytes: r > 0xFF ? 2 : 1, hex: wdata.value });
+          await call('i2c.write', { bus: d.bus, addr: d.addr, reg: r, regBytes: wide.checked || r > 0xFF ? 2 : 1, hex: wdata.value });
           toast('Written', 'ok', 1200);
         } catch (e) { fail(e); }
       } }, 'Write'))),
@@ -1703,7 +1761,8 @@ function drawerI2cRegs(d) {
 function rawWatchBtn(d, reg, fmt, regBytes) {
   return h('button', { class: 'btn small ghost', title: 'Add to watch list', onclick: async () => {
     const full = S.devices.get(d.key);
-    const watch = (full.watch || []).map(stripWatch);
+    if (!needFull(d.key)) return;
+    const watch = full.watch.map(stripWatch);
     if (watch.length >= 16) return toast('Watch list is full (16 items)', 'err');
     watch.push({ name: `reg ${hexAddr(reg)}`, fn: 0, addr: reg, sub: regBytes, count: Math.max(1, FMT_BYTES[fmt] || 1), fmt, scale: 1, unit: '' });
     try { await call('dev.update', { key: d.key, watch, pollMs: full.pollMs || 1000 }); toast('Added to watch list', 'ok', 1500); refreshSelected(); } catch (e) { fail(e); }
@@ -1765,15 +1824,16 @@ function renderWatchValues(d, tbody) {
   tbody.replaceChildren(...ws.map((w, i) => {
     let val = '—';
     if (w.ts) {
-      if (w.err) val = d.proto === 'canopen' && w.abort ? abortText(w.abort) : (w.err === -1 ? 'timeout' : d.proto === 'modbus' && w.err > 0 ? 'exception ' + w.err : 'error');
+      if (w.err) val = d.proto === 'canopen' && w.abort ? abortText(w.abort) : (w.err === -1 ? (d.proto === 'i2c' ? 'NACK' : d.proto === 'spi' ? 'error' : 'timeout') : d.proto === 'modbus' && w.err > 0 ? 'exception ' + w.err : 'error');
       else val = fmtValue(decodeValue(w.fmt, hexBytes(w.raw), d.proto, w.fn), w.scale, w.unit);
     }
     const src = d.proto === 'modbus' ? `${({ 1: 'coil', 2: 'input', 3: 'hr', 4: 'ir' })[w.fn]} ${w.addr}${w.count > 1 ? '+' + (w.count - 1) : ''}`
       : isRawProto(d.proto) ? `${w.sub === 2 ? '0x' + hex4(w.addr) : hexAddr(w.addr)} ×${w.count}` : `${hex4(w.addr)}:${w.sub}`;
     return h('tr', null, h('td', null, w.name || '(unnamed)'), h('td', { class: 'mono faint' }, src),
       h('td', { class: 'mono' }, h('span', { class: w.err ? 'faint' : 'val-big', style: { fontSize: '14px' } }, val)),
-      h('td', null, chartSpark(d.key + '|' + i, `${devName(d)} ${w.name || ''}`.trim(), w.unit)),
+      h('td', null, chartSpark(watchKey(d, w), `${devName(d)} ${w.name || ''}`.trim(), w.unit)),
       h('td', null, h('button', { class: 'btn small ghost', title: 'Remove', onclick: async () => {
+        if (!needFull(d.key)) return;
         const watch = ws.map(stripWatch); watch.splice(i, 1);
         try { await call('dev.update', { key: d.key, watch }); refreshSelected(); } catch (e) { fail(e); }
       } }, '✕')));
@@ -1799,10 +1859,12 @@ function drawerWatch(d) {
     const bytes = h('input', { type: 'number', min: 1, max: 16, value: 2, class: 'w-sm', title: 'Bytes to read' });
     fmt.replaceChildren(...Object.entries(RAW_FMTS).map(([k, v]) => h('option', { value: k, selected: k === 'u16be' }, v)));
     fmt.addEventListener('change', () => { bytes.value = FMT_BYTES[fmt.value] || 1; });
-    src = { nodes: [reg, h('span', { class: 'muted' }, 'bytes'), bytes], get: () => {
+    const wide = h('input', { type: 'checkbox' });
+    const wideLbl = d.proto === 'i2c' ? h('label', { class: 'check', title: '16-bit register address (EEPROMs)' }, wide, '16-bit') : null;
+    src = { nodes: [reg, h('span', { class: 'muted' }, 'bytes'), bytes, wideLbl], get: () => {
       const r = parseNum(reg.value.match(/^0x/i) ? reg.value : '0x' + reg.value);
       if (isNaN(r) || r < 0 || r > 0xFFFF) throw new Error('Register must be hex 00..FFFF');
-      return { fn: 0, addr: r, sub: r > 0xFF ? 2 : 1, count: clamp(+bytes.value || 1, 1, 16), fmt: fmt.value };
+      return { fn: 0, addr: r, sub: wide.checked || r > 0xFF ? 2 : 1, count: clamp(+bytes.value || 1, 1, 16), fmt: fmt.value };
     } };
   } else {
     const idx = h('input', { placeholder: 'index hex', class: 'w-md' });
@@ -1813,7 +1875,8 @@ function drawerWatch(d) {
   const add = async () => {
     try {
       const it = Object.assign({ name: name.value || 'item', scale: parseFloat(scale.value) || 1, unit: unit.value }, src.get());
-      const watch = (S.devices.get(d.key).watch || []).map(stripWatch);
+      if (!needFull(d.key)) return;
+      const watch = S.devices.get(d.key).watch.map(stripWatch);
       if (watch.length >= 16) throw new Error('Watch list is full (16 items)');
       watch.push(it);
       await call('dev.update', { key: d.key, watch, pollMs: +poll.value || 1000 });
@@ -1884,8 +1947,9 @@ function decodeI2c(f, bytes) {
   const bus = BUS_IDS[f.bus];
   const d = S.devices.get(`${bus}:i2c:${f.id}`);
   const who = `${hexAddr(f.id)}${d ? ' ' + devName(d) : ''}`;
-  if (f.fl & TF_NACK) return `${f.dir ? 'read' : 'write'} ${who}: NACK`;
-  if (f.dir) return `read ${who}: ${bytes.length} byte${bytes.length === 1 ? '' : 's'}`;
+  // trace.h: DIR_TX (1) = write, DIR_RX (0) = read
+  if (f.fl & TF_NACK) return `${f.dir ? 'write' : 'read'} ${who}: NACK`;
+  if (!f.dir) return `read ${who}: ${bytes.length} byte${bytes.length === 1 ? '' : 's'}`;
   if (bytes.length) return `write ${who}: ${bytes.map(hex2).join(' ')}`;
   return `probe ${who}`;
 }
@@ -1898,7 +1962,7 @@ function frameText(f) {
     case 'qwiic': case 'i2c': f._dec = decodeI2c(f, bytes); break;
     case 'spi': {
       const d = S.devices.get(`spi:spi:${f.id}`);
-      f._dec = `${f.dir ? 'MISO' : 'MOSI'} CS IO${f.id}${d ? ' ' + devName(d) : ''}` + (!f.dir && bytes[0] === 0x9F ? ' · JEDEC ID read' : '');
+      f._dec = `${f.dir ? 'MOSI' : 'MISO'} CS IO${f.id}${d ? ' ' + devName(d) : ''}` + (f.dir && bytes[0] === 0x9F ? ' · JEDEC ID read' : '');
       break;
     }
     default: f._dec = '';
@@ -1925,8 +1989,8 @@ function frameId(f) {
 }
 function frameDir(f) {
   const b = BUS_IDS[f.bus];
-  if (b === 'spi') return f.dir ? 'MISO' : 'MOSI';
-  if (b === 'qwiic' || b === 'i2c') return f.dir ? 'R' : 'W';
+  if (b === 'spi') return f.dir ? 'MOSI' : 'MISO';
+  if (b === 'qwiic' || b === 'i2c') return f.dir ? 'W' : 'R';
   return f.dir ? 'TX' : 'RX';
 }
 function fmtFrameTime(f) {
@@ -1940,7 +2004,7 @@ function fmtFrameTime(f) {
 function trafficRow(f) {
   const b = BUS_IDS[f.bus];
   const bad = (b === 'rs485' && !(f.fl & 4)) || (f.fl & TF_NACK);
-  const tx = b === 'rs485' || b === 'can' ? f.dir : !f.dir;  // I2C write / SPI MOSI originate here
+  const tx = f.dir;  // DIR_TX on every bus: frames this board sent (incl. I2C writes, SPI MOSI)
   const cls = (tx ? 'tx' : '') + (bad ? ' bad' : '');
   return h('tr', { class: cls },
     h('td', { class: 'mono' }, fmtFrameTime(f)),
@@ -2077,6 +2141,13 @@ const Console = {
   },
   focus() { this.build(); setTimeout(() => this.input.focus(), 0); },
   clear() { this.out.replaceChildren(); this.lines = 0; },
+  // The board drops subscriptions and in-flight commands when the socket closes.
+  disconnected() {
+    for (const block of this.pending.values()) this.print('connection lost', 'err', block);
+    this.pending.clear();
+    this.tracing = false;
+    if (this.traceBtn) this.traceBtn.classList.remove('primary');
+  },
   // Print a line; if 'into' is given (a command's block), the output goes under that command.
   print(text, cls, into) {
     text = String(text).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '');
@@ -2084,7 +2155,7 @@ const Console = {
     const line = h('div', { class: cls || '' }, text);
     (into && into.isConnected ? into : this.out).append(line);
     this.lines++;
-    while (this.lines > 3000 && this.out.firstChild) { this.out.firstChild.remove(); this.lines--; }
+    while (this.out.childElementCount > 1500) this.out.firstChild.remove();  // whole entries, oldest first
     if (atBottom) this.out.scrollTop = this.out.scrollHeight;
     return line;
   },
@@ -2112,7 +2183,7 @@ const Console = {
       this.pending.delete(m.id);
       if (text) this.print(text, /^error:|^Unknown command|^Usage:|^Invalid argument/.test(text) ? 'err' : '', block);
     } else if (text) {
-      const isTrace = /^\s*[\d:.]+( s)? +(CAN|RS485)/.test(text) || text.startsWith('...');
+      const isTrace = /^\s*[\d:.]+( s)? +(CAN|RS485|QWIIC|I2C|SPI)\b/.test(text) || text.startsWith('...');
       // Progress notes belong to the most recent command still awaiting its reply.
       const blocks = [...this.pending.values()];
       this.print(text, isTrace ? 'tr' : 'note', isTrace ? null : blocks[blocks.length - 1]);
@@ -2258,7 +2329,7 @@ function renderSettings() {
       h('label', { class: 'check' }, cJ, 'Discover J1939 ECUs passively (29-bit traffic)'),
       h('div', { class: 'row' },
         h('button', { class: 'btn primary', onclick: async () => {
-          try { if (cMode.value === 'normal' && !canActive()) await setCanMode('normal'); } catch (e) { if (e.message !== 'Cancelled') fail(e); return; }
+          try { if (cMode.value === 'normal' && !canActive()) await confirmActive(+cBr.value); } catch (e) { if (e.message !== 'Cancelled') fail(e); return; }
           applyBus('can', { enabled: cEn.checked, bitrate: +cBr.value, mode: cMode.value, autoRecover: cRec.checked, canopenPassive: cCo.checked, j1939Passive: cJ.checked, j1939Sa: +cSa.value, sdoTimeoutMs: +cSdo.value, scanTimeoutMs: +cScan.value }, 'CAN settings applied');
         } }, 'Apply'),
         h('button', { class: 'btn', onclick: autobaud }, 'Detect bitrate'),
@@ -2278,11 +2349,12 @@ function renderSettings() {
         if (!await confirmBox('Apply Wi-Fi settings?', 'Wi-Fi restarts; this page may lose its connection.', 'Apply')) return;
         save('wifi.config', () => args, 'Wi-Fi settings saved — reconnecting')();
       } }, 'Save & reconnect')),
-      s.wifi ? h('p', { class: 'hint' }, `AP ${s.wifi.ap.ip} · ${s.wifi.sta.connected ? `joined "${s.wifi.sta.ssid}" as ${s.wifi.sta.ip}` : s.wifi.sta.ssid ? `not connected to "${s.wifi.sta.ssid}"` : 'not joined to a network'}`) : null),
+      h('p', { class: 'hint', id: 'setWifiLine' }, wifiLine(s))),
     card('Dashboard login',
-      h('div', { class: 'form-grid' }, field('User', aUser), field('Password', aPass, 'Empty disables the login')),
+      h('div', { class: 'form-grid' }, field('User', aUser), field('Password', aPass, 'Empty keeps the current password')),
       h('div', { class: 'row' },
-        h('button', { class: 'btn primary', onclick: save('auth.config', () => ({ user: aUser.value, pass: aPass.value }), 'Login settings saved') }, 'Save'),
+        // Empty password field means "unchanged"; "Disable login" is the explicit way to turn it off.
+        h('button', { class: 'btn primary', onclick: save('auth.config', () => Object.assign({ user: aUser.value }, aPass.value ? { pass: aPass.value } : {}), 'Login settings saved') }, 'Save'),
         st.auth.enabled ? h('button', { class: 'btn', onclick: save('auth.config', () => ({ pass: '' }), 'Login disabled') }, 'Disable login') : null),
       h('p', { class: 'hint' }, st.auth.enabled ? 'Login is enabled.' : 'No login required. Set a password on shared networks.')),
     card('Expansion: I²C and SPI',
@@ -2315,7 +2387,7 @@ function renderSettings() {
         h('dt', null, 'Firmware'), h('dd', null, `${S.hello.fw} ${S.hello.version} (${S.hello.build})`),
         h('dt', null, 'Board'), h('dd', null, S.hello.board),
         h('dt', null, 'MAC'), h('dd', { class: 'mono' }, S.hello.mac),
-        h('dt', null, 'Clock'), h('dd', null, s.epoch ? new Date(s.epoch).toLocaleString() + (s.wifi && s.wifi.ntp ? ' (NTP)' : ' (from browser)') : 'not set')),
+        h('dt', null, 'Clock'), h('dd', { id: 'setClock' }, clockText(s))),
       h('div', { class: 'row' }, otaFile, h('button', { class: 'btn', onclick: () => otaUpload(otaFile, otaBar) }, 'Update firmware')), otaBar,
       h('p', { class: 'hint' }, 'File: .pio/build/wonderscope/firmware.bin. Reboots on completion.'),
       h('div', { class: 'row' },

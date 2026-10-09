@@ -112,7 +112,9 @@ static bool dev_key_arg(const char *s, String &key) {
 // Command table
 // ======================================================================
 
+struct CliCmd;
 struct Ctx {
+  const CliCmd *cmd = nullptr;  // per call: the console runs in two tasks (serial, web)
   uint32_t client;
   int32_t id;
   JsonDocument req;
@@ -763,7 +765,7 @@ static bool cmd_nmt(Args &a, Ctx &c) {
   if (!m) return usage_err(c, cmd);
   REQ(c, "co.nmt");
   c.req["node"] = node;
-  c.req["cmd"] = m;
+  c.req["nmt"] = m;
   render_as(c, "co.nmt");
   return true;
 }
@@ -822,7 +824,7 @@ static bool cmd_cansend(Args &a, Ctx &c) {
   long id;
   if (!hexnum(idstr, id)) return usage_err(c, f);
   REQ(c, "can.send");
-  c.req["id"] = id;
+  c.req["canId"] = id;
   c.req["ext"] = il > 3;
   const char *d = hash + 1;
   if (*d == 'R' || *d == 'r') {
@@ -880,7 +882,9 @@ static bool cmd_wifi(Args &a, Ctx &c) {
   REQ(c, "wifi.config");
   if (a.is(1, "ap") && a.n >= 3) {
     c.req["apSsid"] = a[2];
-    c.req["apPass"] = a.n > 3 ? a[3] : "";
+    // Password omitted: keep the current one. An open AP needs the explicit keyword.
+    if (a.is(3, "open")) c.req["apPass"] = "";
+    else if (a.n > 3) c.req["apPass"] = a[3];
   } else if (a.is(1, "sta") && a.is(2, "off")) {
     c.req["staSsid"] = "";
     c.req["staPass"] = "";
@@ -1091,13 +1095,14 @@ const CliCmd CMDS[] = {
      "  cansend 000#0100           NMT start all\n"
      "  cansend 123#01 10 100      ten frames, 100 ms apart",
      cmd_cansend},
-    {"trace", "trace [on|off] [rs485|can|all]", "Stream live bus frames to this console",
+    {"trace", "trace [on|off] [rs485|can|i2c|spi|all]", "Stream live bus frames to this console",
      "Prints each RX and TX frame. The dashboard Traffic tab adds protocol decoding.",
      cmd_trace},
-    {"wifi", "wifi | wifi ap <ssid> [pass] | wifi sta <ssid> [pass] | wifi sta off | wifi hostname <name>",
+    {"wifi", "wifi | wifi ap <ssid> [pass|open] | wifi sta <ssid> [pass] | wifi sta off | wifi hostname <name>",
      "Show or change Wi-Fi",
      "The access point is always on (default password 'wonderscope').\n"
      "Joining a network adds http://<hostname>.local\n"
+     "'wifi ap <ssid>' keeps the current AP password; 'open' removes it.\n"
      "Examples:\n"
      "  wifi sta MyShopWiFi s3cretpass\n"
      "  wifi ap WonderScope-Line3 newpassword",
@@ -1113,13 +1118,10 @@ const CliCmd CMDS[] = {
 };
 const size_t NCMDS = sizeof(CMDS) / sizeof(CMDS[0]);
 
-static const CliCmd *current;
-
 static bool usage_err(Ctx &c, const char *bad) {
   c.out = "";
   if (bad && *bad) c.out = String("Invalid argument '") + bad + "'.\n";
-  c.out += String("Usage: ") + (current ? current->usage : "?") + "\n(see 'help " +
-           (current ? current->name : "") + "')";
+  c.out += String("Usage: ") + (c.cmd ? c.cmd->usage : "?") + "\n(see 'help " + (c.cmd ? c.cmd->name : "") + "')";
   return false;
 }
 
@@ -1136,8 +1138,7 @@ void cli_exec(const char *line, uint32_t client, int32_t id) {
   tokenize(line, a);
   if (client == CLIENT_SERIAL && id < 0) id = nextSerialId++;
   if (a.n == 0) {
-    if (client == CLIENT_SERIAL) out_text(client, "", id);
-    else out_text(client, "", id);
+    out_text(client, "", id);
     return;
   }
   // aliases
@@ -1145,17 +1146,16 @@ void cli_exec(const char *line, uint32_t client, int32_t id) {
   if (!strcasecmp(name, "?") || !strcasecmp(name, "h")) name = "help";
   else if (!strcasecmp(name, "ls")) name = "devices";
   else if (!strcasecmp(name, "factory")) name = "factory-reset";
-  current = nullptr;
+  Ctx c;
   for (size_t i = 0; i < NCMDS; i++)
-    if (!strcasecmp(CMDS[i].name, name)) current = &CMDS[i];
-  if (!current) {
+    if (!strcasecmp(CMDS[i].name, name)) c.cmd = &CMDS[i];
+  if (!c.cmd) {
     out_text(client, String("Unknown command '") + a[0] + "'. Type 'help' for the list.", id);
     return;
   }
-  Ctx c;
   c.client = client;
   c.id = id;
-  bool dispatch = current->fn(a, c);
+  bool dispatch = c.cmd->fn(a, c);
   if (!dispatch) {
     out_text(client, c.out, id);
     return;
@@ -1225,9 +1225,9 @@ static const char *sdo_abort_text(uint32_t code) {
 static String status_rs485(JsonObjectConst r) {
   char b[256];
   snprintf(b, sizeof(b), "RS485  %s  %lu 8%s%d  timeout %dms  rx %lu  tx %lu  err %lu%s%s",
-           r["enabled"] ? (r["up"] ? "ON " : "ERR") : "OFF", (unsigned long)(r["baud"] | 0),
+           r["enabled"] ? (r["up"] ? "ON " : "ERR") : "OFF", (unsigned long)(r["baud"] | 0u),
            (const char *)(r["parity"] | "N"), (int)(r["stop"] | 1), (int)(r["timeoutMs"] | 0),
-           (unsigned long)(r["rx"] | 0), (unsigned long)(r["tx"] | 0), (unsigned long)(r["err"] | 0),
+           (unsigned long)(r["rx"] | 0u), (unsigned long)(r["tx"] | 0u), (unsigned long)(r["err"] | 0u),
            strlen(r["busy"] | "") ? "  busy:" : "", (const char *)(r["busy"] | ""));
   return b;
 }
@@ -1235,10 +1235,10 @@ static String status_rs485(JsonObjectConst r) {
 static String status_can(JsonObjectConst c) {
   char b[300];
   snprintf(b, sizeof(b), "CAN    %s  %lu kbit/s  %s  state %s  TEC %d REC %d  rx %lu  tx %lu  busErr %lu  ids %d%s%s",
-           c["enabled"] ? (c["up"] ? "ON " : "ERR") : "OFF", (unsigned long)((c["bitrate"] | 0) / 1000),
+           c["enabled"] ? (c["up"] ? "ON " : "ERR") : "OFF", (unsigned long)((c["bitrate"] | 0u) / 1000),
            strcmp(c["mode"] | "", "listen") ? "ACTIVE" : "listen-only", (const char *)(c["state"] | "?"),
-           (int)(c["tec"] | 0), (int)(c["rec"] | 0), (unsigned long)(c["rx"] | 0), (unsigned long)(c["tx"] | 0),
-           (unsigned long)(c["busErrors"] | 0), (int)(c["ids"] | 0), strlen(c["busy"] | "") ? "  busy:" : "",
+           (int)(c["tec"] | 0), (int)(c["rec"] | 0), (unsigned long)(c["rx"] | 0u), (unsigned long)(c["tx"] | 0u),
+           (unsigned long)(c["busErrors"] | 0u), (int)(c["ids"] | 0), strlen(c["busy"] | "") ? "  busy:" : "",
            (const char *)(c["busy"] | ""));
   return b;
 }
@@ -1252,9 +1252,9 @@ static String hz_text(uint32_t hz) {
 static String status_i2c(const char *label, JsonObjectConst q) {
   char b[200];
   snprintf(b, sizeof(b), "%-6s %s  %s  SDA IO%d SCL IO%d  autoscan %s  rx %lu  tx %lu  nack %lu", label,
-           q["enabled"] ? "ON " : "OFF", hz_text(q["hz"] | 0).c_str(), (int)(q["sda"] | 0), (int)(q["scl"] | 0),
-           (q["autoScan"] | false) ? "on" : "off", (unsigned long)(q["rx"] | 0), (unsigned long)(q["tx"] | 0),
-           (unsigned long)(q["err"] | 0));
+           q["enabled"] ? "ON " : "OFF", hz_text(q["hz"] | 0u).c_str(), (int)(q["sda"] | 0), (int)(q["scl"] | 0),
+           (q["autoScan"] | false) ? "on" : "off", (unsigned long)(q["rx"] | 0u), (unsigned long)(q["tx"] | 0u),
+           (unsigned long)(q["err"] | 0u));
   return b;
 }
 
@@ -1263,7 +1263,7 @@ static String status_spi(JsonObjectConst s) {
   for (JsonVariantConst v : s["cs"].as<JsonArrayConst>()) cs += (cs.length() ? "," : "") + String("IO") + (int)v;
   char b[200];
   snprintf(b, sizeof(b), "SPI    %s  %s mode %d  SCK IO12 MOSI IO11 MISO IO13  CS %s  readbit %s", s["enabled"] ? "ON " : "OFF",
-           hz_text(s["hz"] | 0).c_str(), (int)(s["mode"] | 0), cs.c_str(), (s["readBit"] | true) ? "on" : "off");
+           hz_text(s["hz"] | 0u).c_str(), (int)(s["mode"] | 0), cs.c_str(), (s["readBit"] | true) ? "on" : "off");
   return b;
 }
 
@@ -1300,8 +1300,8 @@ static String render_device(JsonObjectConst d, uint32_t now) {
   int consec = d["consecErr"] | 0;
   snprintf(b, sizeof(b), "  status     %s%s, last seen %s, rx %lu, errors %lu\n",
            consec >= 3 ? "NOT RESPONDING" : present ? "online" : "not seen since boot",
-           (d["passive"] | false) ? " (passive)" : "", fmt_age(now, d["lastSeen"] | 0).c_str(),
-           (unsigned long)(d["rx"] | 0), (unsigned long)(d["errs"] | 0));
+           (d["passive"] | false) ? " (passive)" : "", fmt_age(now, d["lastSeen"] | 0u).c_str(),
+           (unsigned long)(d["rx"] | 0u), (unsigned long)(d["errs"] | 0u));
   s += b;
   if (!d["state"].isNull()) s += String("  NMT state  ") + nmt_state(d["state"]) + "\n";
   if (!d["baud"].isNull())
@@ -1313,14 +1313,14 @@ static String render_device(JsonObjectConst d, uint32_t now) {
   if (d["co"].is<JsonObjectConst>()) {
     JsonObjectConst co = d["co"];
     snprintf(b, sizeof(b), "  identity   vendor 0x%08lX product 0x%08lX rev 0x%08lX serial %lu\n",
-             (unsigned long)(co["vendorId"] | 0), (unsigned long)(co["productCode"] | 0),
-             (unsigned long)(co["revision"] | 0), (unsigned long)(co["serial"] | 0));
+             (unsigned long)(co["vendorId"] | 0u), (unsigned long)(co["productCode"] | 0u),
+             (unsigned long)(co["revision"] | 0u), (unsigned long)(co["serial"] | 0u));
     s += b;
   }
   if (d["emcy"].is<JsonObjectConst>()) {
     snprintf(b, sizeof(b), "  EMCY       code 0x%04X reg 0x%02X (%lu total, %s)\n", (unsigned)(d["emcy"]["code"] | 0),
-             (unsigned)(d["emcy"]["reg"] | 0), (unsigned long)(d["emcy"]["count"] | 0),
-             fmt_age(now, d["emcy"]["ts"] | 0).c_str());
+             (unsigned)(d["emcy"]["reg"] | 0), (unsigned long)(d["emcy"]["count"] | 0u),
+             fmt_age(now, d["emcy"]["ts"] | 0u).c_str());
     s += b;
   }
   if (d["notes"].is<const char *>() && strlen(d["notes"])) s += String("  notes      ") + (const char *)d["notes"] + "\n";
@@ -1340,7 +1340,7 @@ static String render_device(JsonObjectConst d, uint32_t now) {
       snprintf(b, sizeof(b), "    %-20s %s  raw %s%s\n", (const char *)(it["name"] | ""),
                (int)(it["fn"] | 0) ? (String("fn") + (int)it["fn"] + " @" + (int)it["addr"]).c_str()
                                    : (String("0x") + String((int)it["addr"], HEX) + ":" + (int)it["sub"]).c_str(),
-               (const char *)(it["raw"] | "-"), (int)(it["err"] | 0) ? "  (error)" : "");
+               (const char *)(it["raw"] | "-"), (int)(it["err"] | 0u) ? "  (error)" : "");
       s += b;
     }
   }
@@ -1348,8 +1348,8 @@ static String render_device(JsonObjectConst d, uint32_t now) {
   if (p.size()) {
     s += "  PGNs seen\n";
     for (JsonObjectConst e : p) {
-      snprintf(b, sizeof(b), "    %6lu (0x%05lX)  x%-7lu %s\n", (unsigned long)(e["pgn"] | 0), (unsigned long)(e["pgn"] | 0),
-               (unsigned long)(e["count"] | 0), (const char *)(e["data"] | ""));
+      snprintf(b, sizeof(b), "    %6lu (0x%05lX)  x%-7lu %s\n", (unsigned long)(e["pgn"] | 0u), (unsigned long)(e["pgn"] | 0u),
+               (unsigned long)(e["count"] | 0u), (const char *)(e["data"] | ""));
       s += b;
     }
   }
@@ -1364,8 +1364,8 @@ String cli_render(const char *cmd, JsonDocument &doc) {
   if (r == "ok") return "OK";
   if (r == "note") return o["note"] | "OK";
   if (r == "status") {
-    return String(FW_NAME " up ") + (uint32_t)((o["up"] | 0) / 1000) + "s  heap " + (uint32_t)(o["heap"] | 0) / 1024 +
-           "k  psram " + (uint32_t)(o["psram"] | 0) / 1024 + "k  web clients " + (int)(o["clients"] | 0) +
+    return String(FW_NAME " up ") + (uint32_t)((o["up"] | 0u) / 1000) + "s  heap " + (uint32_t)(o["heap"] | 0u) / 1024 +
+           "k  psram " + (uint32_t)(o["psram"] | 0u) / 1024 + "k  web clients " + (int)(o["clients"] | 0) +
            "  devices " + (int)(o["devices"] | 0) + "\n" + "Time   " + fmt_time(o["epoch"] | (int64_t)0) + "\n" +
            status_wifi(o["wifi"]) + "\n" + status_rs485(o["rs485"]) + "\n" + status_can(o["can"]) + "\n" +
            status_i2c("Qwiic", o["qwiic"]) + "\n" + status_i2c("I2C", o["i2c"]) + "\n" + status_spi(o["spi"]);
@@ -1420,25 +1420,25 @@ String cli_render(const char *cmd, JsonDocument &doc) {
   if (r == "info") {
     return String(o["fw"] | "") + " " + (const char *)(o["version"] | "") + " (built " + (const char *)(o["build"] | "") +
            ")\n" + "Board  " + (const char *)(o["board"] | "") + "\nChip   " + (const char *)(o["chip"] | "") +
-           ", flash " + (uint32_t)(o["flash"] | 0) / 1048576 + " MB, PSRAM " +
-           (uint32_t)(o["psramSize"] | 0) / 1048576 + " MB\nMAC    " + (const char *)(o["mac"] | "");
+           ", flash " + (uint32_t)(o["flash"] | 0u) / 1048576 + " MB, PSRAM " +
+           (uint32_t)(o["psramSize"] | 0u) / 1048576 + " MB\nMAC    " + (const char *)(o["mac"] | "");
   }
   if (r == "auth") return (o["enabled"] | false) ? String("Dashboard login enabled for user '") + (const char *)(o["user"] | "") + "'"
                                                  : String("Dashboard login disabled");
-  if (r == "dev.clear") return String("Removed ") + (int)(o["removed"] | 0) + " devices";
+  if (r == "dev.clear") return String("Removed ") + (int)(o["removed"] | 0u) + " devices";
   if (r == "scan") {
     JsonArrayConst f = o["found"];
     String s = String(o["cancelled"] | false ? "Scan cancelled. " : "Scan complete. ") + f.size() + " device" +
                (f.size() == 1 ? "" : "s") + " found.\n";
     for (JsonObjectConst d : f) {
       if (!d["addr"].isNull()) {
-        snprintf(b, sizeof(b), "  mb%-4d %6lu 8%s1  %s %s %s %s\n", (int)d["addr"], (unsigned long)(d["baud"] | 0),
+        snprintf(b, sizeof(b), "  mb%-4d %6lu 8%s1  %s %s %s %s\n", (int)d["addr"], (unsigned long)(d["baud"] | 0u),
                  (const char *)(d["parity"] | "N"), (const char *)(d["vendor"] | ""), (const char *)(d["product"] | ""),
                  (const char *)(d["revision"] | ""), (const char *)(d["name"] | ""));
       } else if (!d["node"].isNull()) {
         snprintf(b, sizeof(b), "  co%-4d %s  vendor 0x%08lX product 0x%08lX  %s\n", (int)d["node"],
-                 (const char *)(d["name"] | "(no name)"), (unsigned long)(d["vendorId"] | 0),
-                 (unsigned long)(d["productCode"] | 0), (const char *)(d["swVersion"] | ""));
+                 (const char *)(d["name"] | "(no name)"), (unsigned long)(d["vendorId"] | 0u),
+                 (unsigned long)(d["productCode"] | 0u), (const char *)(d["swVersion"] | ""));
       } else {
         snprintf(b, sizeof(b), "  j%-5d NAME %s  %s %s\n", (int)(d["sa"] | 0), (const char *)(d["name"] | ""),
                  (const char *)(d["vendor"] | ""), (const char *)(d["product"] | ""));
@@ -1451,7 +1451,7 @@ String cli_render(const char *cmd, JsonDocument &doc) {
   }
   if (r == "dev.list") {
     JsonArrayConst ds = o["devices"];
-    uint32_t now = o["now"] | 0;
+    uint32_t now = o["now"] | 0u;
     if (!ds.size()) return "No devices. Discover with: scan rs485 | scan canopen | scan j1939";
     String s = "KEY                LABEL                STATUS            LAST SEEN  IDENTITY\n";
     for (JsonObjectConst d : ds) {
@@ -1462,7 +1462,7 @@ String cli_render(const char *cmd, JsonDocument &doc) {
                      (const char *)(d["name"] | "");
       ident.trim();
       snprintf(b, sizeof(b), "%-18s %-20.20s %-17s %-10s %s\n", (const char *)(d["key"] | ""),
-               (const char *)(d["label"] | ""), st, fmt_age(now, d["lastSeen"] | 0).c_str(), ident.c_str());
+               (const char *)(d["label"] | ""), st, fmt_age(now, d["lastSeen"] | 0u).c_str(), ident.c_str());
       s += b;
     }
     return s;
@@ -1490,7 +1490,7 @@ String cli_render(const char *cmd, JsonDocument &doc) {
     }
     return s;
   }
-  if (r == "mb.write") return String("OK: wrote ") + (int)(o["written"] | 0) + " value(s) with FC" + (int)(o["fn"] | 0);
+  if (r == "mb.write") return String("OK: wrote ") + (int)(o["written"] | 0u) + " value(s) with FC" + (int)(o["fn"] | 0);
   if (r == "mb.raw") {
     String s = String("TX ") + (const char *)(o["tx"] | "");
     if (o["rx"].is<const char *>())
@@ -1525,30 +1525,30 @@ String cli_render(const char *cmd, JsonDocument &doc) {
     return s + "= \"" + (const char *)(o["text"] | "") + "\"  [" + (int)(o["size"] | 0) + " bytes] " +
            (const char *)(o["hex"] | "");
   }
-  if (r == "co.nmt") return String("NMT ") + (const char *)(o["cmd"] | "") + " sent to " +
+  if (r == "co.nmt") return String("NMT ") + (const char *)(o["nmt"] | "") + " sent to " +
                             ((int)(o["node"] | 0) ? String("node ") + (int)o["node"] : String("all nodes"));
   if (r == "co.info") {
     String s = String("Node ") + (int)(o["node"] | 0) + "\n";
-    snprintf(b, sizeof(b), "  device type 0x%08lX\n", (unsigned long)(o["deviceType"] | 0));
+    snprintf(b, sizeof(b), "  device type 0x%08lX\n", (unsigned long)(o["deviceType"] | 0u));
     s += b;
     const char *keys[] = {"name", "hwVersion", "swVersion"};
     for (const char *k : keys)
       if (o[k].is<const char *>()) s += "  " + pad(k, 12) + (const char *)o[k] + "\n";
     if (!o["vendorId"].isNull()) {
       snprintf(b, sizeof(b), "  vendor 0x%08lX  product 0x%08lX  revision 0x%08lX  serial %lu\n",
-               (unsigned long)o["vendorId"], (unsigned long)(o["productCode"] | 0), (unsigned long)(o["revision"] | 0),
-               (unsigned long)(o["serial"] | 0));
+               (unsigned long)o["vendorId"], (unsigned long)(o["productCode"] | 0u), (unsigned long)(o["revision"] | 0u),
+               (unsigned long)(o["serial"] | 0u));
       s += b;
     }
     return s;
   }
   if (r == "j1939.request") {
     JsonArrayConst rs = o["responses"];
-    String s = String("PGN ") + (long)(o["pgn"] | 0) + ": " + rs.size() + " response(s)\n";
+    String s = String("PGN ") + (long)(o["pgn"] | 0u) + ": " + rs.size() + " response(s)\n";
     for (JsonObjectConst x : rs) s += String("  SA ") + (int)x["sa"] + "  " + (const char *)(x["data"] | "") + "\n";
     return s;
   }
-  if (r == "can.send") return String("Sent ") + (int)(o["sent"] | 0) + " frame(s)";
+  if (r == "can.send") return String("Sent ") + (int)(o["sent"] | 0u) + " frame(s)";
   if (r == "can.ids") {
     JsonArrayConst ids = o["ids"];
     if (!ids.size()) return "No CAN traffic received.";
@@ -1567,7 +1567,7 @@ String cli_render(const char *cmd, JsonDocument &doc) {
     String s;
     for (JsonObjectConst t : o["tried"].as<JsonArrayConst>()) {
       snprintf(b, sizeof(b), "  %7lu bit/s: %lu frames, %lu errors\n", (unsigned long)t["bitrate"],
-               (unsigned long)(t["frames"] | 0), (unsigned long)(t["errors"] | 0));
+               (unsigned long)(t["frames"] | 0u), (unsigned long)(t["errors"] | 0u));
       s += b;
     }
     if (o["detected"].isNull()) s += "No valid traffic at any bitrate. Check H/L/GND wiring and termination.";
@@ -1575,7 +1575,7 @@ String cli_render(const char *cmd, JsonDocument &doc) {
     return s;
   }
   if (r == "can.selftest")
-    return (o["pass"] | false) ? String("PASS - controller and transceiver loopback OK (") + (uint32_t)(o["roundTripUs"] | 0) + " us)"
+    return (o["pass"] | false) ? String("PASS - controller and transceiver loopback OK (") + (uint32_t)(o["roundTripUs"] | 0u) + " us)"
                                : String("FAIL - frame not received back (") + (const char *)(o["sendResult"] | "") + ")";
   // default: pretty JSON
   String s;
@@ -1673,6 +1673,7 @@ void cli_serial_loop() {
     }
     if (ch == 3) {  // Ctrl-C: stop trace, clear line
       len = 0;
+      jsonLine = false;
       JsonDocument req;
       req["cmd"] = "sub";
       req["topics"]["textTrace"] = false;

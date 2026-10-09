@@ -242,8 +242,15 @@ const char *wifi_settings_from_json(WifiSettings &s, JsonObjectConst o) {
     if (*v && (strlen(v) < 8 || strlen(v) > 63)) return "AP password must be 8..63 chars (or empty for open)";
     copy_str(n.apPass, sizeof(n.apPass), v);
   }
-  if (o["staSsid"].is<const char *>()) copy_str(n.staSsid, sizeof(n.staSsid), o["staSsid"]);
-  if (o["staPass"].is<const char *>()) copy_str(n.staPass, sizeof(n.staPass), o["staPass"]);
+  if (o["staSsid"].is<const char *>()) {
+    if (strlen(o["staSsid"]) > 32) return "network SSID must be at most 32 chars";
+    copy_str(n.staSsid, sizeof(n.staSsid), o["staSsid"]);
+  }
+  if (o["staPass"].is<const char *>()) {
+    size_t l = strlen(o["staPass"]);
+    if (l && (l < 8 || l > 63)) return "network password must be 8..63 chars (or empty)";
+    copy_str(n.staPass, sizeof(n.staPass), o["staPass"]);
+  }
   if (o["hostname"].is<const char *>()) {
     const char *v = o["hostname"];
     size_t l = strlen(v);

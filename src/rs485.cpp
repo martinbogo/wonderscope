@@ -39,7 +39,7 @@ static uart_parity_t to_parity(uint8_t p) {
 
 static void compute_gap() {
   uint32_t bitsPerChar = 1 + 8 + (cur.parity ? 1 : 0) + cur.stop;
-  uint32_t charUs = bitsPerChar * 1000000UL / cur.baud;
+  uint32_t charUs = bitsPerChar * 1000000UL / (cur.baud ? cur.baud : 9600);
   if (!charUs) charUs = 1;
   uint32_t t35 = charUs * 35 / 10;
   if (cur.baud > 19200 && t35 < 1750) t35 = 1750;  // fixed value per Modbus spec
@@ -351,6 +351,7 @@ static Link link_for(JsonObjectConst a, uint8_t addr) {
     dev_release(d, false);
   }
   if (!a["baud"].isNull()) l.baud = a["baud"];
+  if (l.baud < 300 || l.baud > 1000000) l.baud = g_settings.rs485.baud;  // never apply an invalid rate
   if (a["parity"].is<const char *>()) {
     char c = toupper(a["parity"].as<const char *>()[0]);
     l.parity = c == 'E' ? 1 : c == 'O' ? 2 : 0;
@@ -462,6 +463,8 @@ static void job_read(Job *j) {
   int addr = a["addr"] | -1, fn = a["fn"] | 3, start = a["start"] | 0, count = a["count"] | 1;
   if (addr < 1 || addr > 247) return reply_err(j->rt, "addr must be 1..247");
   if (start < 0 || start > 65535) return reply_err(j->rt, "start must be 0..65535");
+  if (fn < 1 || fn > 4) return reply_err(j->rt, "fn must be 1..4");
+  if (count < 1 || count > (fn <= 2 ? 2000 : 125)) return reply_err(j->rt, "count must be 1..%d", fn <= 2 ? 2000 : 125);
   link_apply(link_for(a, addr));
   uint8_t data[256];
   size_t n;
@@ -491,18 +494,17 @@ static void job_write(Job *j) {
   int addr = a["addr"] | -1, fn = a["fn"] | 6, start = a["start"] | -1;
   if (addr < 0 || addr > 247) return reply_err(j->rt, "addr must be 0..247 (0 = broadcast)");
   if (start < 0 || start > 65535) return reply_err(j->rt, "start must be 0..65535");
-  static uint16_t vals[130];
+  static uint16_t vals[1968];  // FC15 maximum
   uint16_t n = 0;
   JsonArrayConst va = a["values"];
   if (va.isNull()) {
     if (a["value"].isNull()) return reply_err(j->rt, "missing values");
     vals[n++] = (uint16_t)a["value"].as<long>();
   } else {
-    for (JsonVariantConst v : va) {
-      if (n >= 123 && fn == 16) return reply_err(j->rt, "too many values (max 123)");
-      if (n >= 130) break;
-      vals[n++] = v.is<bool>() ? (v.as<bool>() ? 1 : 0) : (uint16_t)v.as<long>();
-    }
+    bool coils = fn == 5 || fn == 15;
+    size_t maxN = coils ? 1968 : 123;
+    if (va.size() > maxN) return reply_err(j->rt, "too many values (max %u)", (unsigned)maxN);
+    for (JsonVariantConst v : va) vals[n++] = v.is<bool>() ? (v.as<bool>() ? 1 : 0) : (uint16_t)v.as<long>();
   }
   if (fn == 6 && n > 1) fn = 16;
   if (fn == 5 && n > 1) fn = 15;
@@ -611,8 +613,20 @@ static void do_poll(const PollTask &p) {
 
 // Passive discovery: a valid request followed by a valid reply from the same
 // address identifies a live device without active polling.
+// The second frame must have the shape of a reply to the first; a master
+// retrying a request to an absent slave must not register a device.
+static bool is_reply(uint8_t reqFn, size_t reqLen, const uint8_t *f, size_t n) {
+  uint8_t fn = f[1];
+  if (fn == (reqFn | 0x80)) return n == 5;               // exception
+  if (fn != reqFn) return false;
+  if (fn >= 1 && fn <= 4) return reqLen == 8 && n == 5u + f[2];  // byte count matches
+  if (fn == 15 || fn == 16) return reqLen > 9 && n == 8;       // echo of start/quantity
+  return false;  // FC05/06 replies are identical to requests: ambiguous
+}
+
 static void on_sniffed(const uint8_t *f, size_t n, uint8_t flags) {
   static uint8_t lastAddr, lastFn;
+  static size_t lastLen;
   static uint32_t lastMs;
   static bool lastValid;
   bool ok = mb_crc_ok(f, n);
@@ -620,8 +634,7 @@ static void on_sniffed(const uint8_t *f, size_t n, uint8_t flags) {
   if (!ok) return;
   uint8_t addr = f[0], fn = f[1];
   uint32_t now = uptime_ms();
-  if (lastValid && addr && addr <= 247 && addr == lastAddr && (fn == lastFn || fn == (lastFn | 0x80)) &&
-      now - lastMs < 1000) {
+  if (lastValid && addr && addr <= 247 && addr == lastAddr && now - lastMs < 1000 && is_reply(lastFn, lastLen, f, n)) {
     Device *d = dev_acquire(BUS_RS485, PROTO_MODBUS, addr, true);
     if (d) {
       bool wasPresent = d->present;
@@ -640,6 +653,7 @@ static void on_sniffed(const uint8_t *f, size_t n, uint8_t flags) {
   } else {
     lastAddr = addr;
     lastFn = fn;
+    lastLen = n;
     lastMs = now;
     lastValid = true;
   }

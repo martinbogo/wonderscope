@@ -85,8 +85,8 @@ void web_text_all(const char *s, size_t n) {
 void web_text(uint32_t client, const char *s, size_t n) { ws.text(client, s, n); }
 
 bool web_client_busy(uint32_t client) {
-  AsyncWebSocketClient *c = ws.client(client);
-  return !c || c->queueIsFull();
+  if (client == CLIENT_SERIAL) return false;
+  return !ws.availableForWrite(client);  // locked lookup; no raw client pointer
 }
 
 size_t web_client_count() { return ws.count(); }
@@ -119,9 +119,26 @@ static void handle_ws_message(uint32_t client, const char *data, size_t len) {
   rpc_dispatch(req, rt);
 }
 
+// Reassembly of fragmented WebSocket messages, one buffer per client.
+struct Frag {
+  uint32_t client;
+  String buf;
+};
+static Frag frags[4];
+
+static Frag *frag_for(uint32_t client, bool create) {
+  for (auto &f : frags)
+    if (f.client == client) return &f;
+  if (!create) return nullptr;
+  for (auto &f : frags)
+    if (!f.client) {
+      f.client = client;
+      return &f;
+    }
+  return nullptr;
+}
+
 static void on_ws(AsyncWebSocket *, AsyncWebSocketClient *c, AwsEventType type, void *arg, uint8_t *data, size_t len) {
-  static String frag;
-  static uint32_t fragClient;
   switch (type) {
     case WS_EVT_CONNECT: {
       sub_set(c->id(), 0);
@@ -131,23 +148,33 @@ static void on_ws(AsyncWebSocket *, AsyncWebSocketClient *c, AwsEventType type, 
       out_send(c->id(), d);
       break;
     }
-    case WS_EVT_DISCONNECT:
+    case WS_EVT_DISCONNECT: {
       sub_remove(c->id());
+      Frag *f = frag_for(c->id(), false);
+      if (f) *f = Frag{0, String()};
       break;
+    }
     case WS_EVT_DATA: {
       AwsFrameInfo *info = (AwsFrameInfo *)arg;
-      if (info->final && info->index == 0 && info->len == len) {
+      if (info->final && info->num == 0 && info->index == 0 && info->len == len) {
         if (info->opcode == WS_TEXT) handle_ws_message(c->id(), (const char *)data, len);
-      } else {
-        if (info->index == 0) {
-          frag = "";
-          fragClient = c->id();
-        }
-        if (fragClient == c->id() && frag.length() + len < 65536) frag.concat((const char *)data, len);
-        if (info->final && info->index + len == info->len && fragClient == c->id()) {
-          handle_ws_message(c->id(), frag.c_str(), frag.length());
-          frag = "";
-        }
+        break;
+      }
+      // Multi-frame or multi-packet message: info->num is the frame number,
+      // info->index the offset within the current frame.
+      bool first = info->num == 0 && info->index == 0;
+      if (first && info->opcode != WS_TEXT) break;
+      Frag *f = frag_for(c->id(), first);
+      if (!f) break;
+      if (first) f->buf = "";
+      if (f->buf.length() + len > 65536) {
+        *f = Frag{0, String()};  // oversized: drop
+        break;
+      }
+      f->buf.concat((const char *)data, len);
+      if (info->final && info->index + len == info->len) {
+        handle_ws_message(c->id(), f->buf.c_str(), f->buf.length());
+        *f = Frag{0, String()};
       }
       break;
     }
@@ -159,6 +186,8 @@ static void on_ws(AsyncWebSocket *, AsyncWebSocketClient *c, AwsEventType type, 
 // ------------------------------------------------------------------ HTTP
 
 static String importBuf;
+static constexpr size_t IMPORT_MAX = 256 * 1024;
+static bool otaReceived;  // a firmware image was received and finalized in this request
 
 void web_begin() {
   ws.onEvent(on_ws);
@@ -194,8 +223,12 @@ void web_begin() {
       "/api/devices", HTTP_POST,
       [](AsyncWebServerRequest *r) {
         GUARD(r);
+        if (r->contentLength() > IMPORT_MAX) {
+          importBuf = String();
+          return r->send(413, "text/plain", "file too large (max 256 KB)");
+        }
         const char *err = dev_import_json(importBuf.c_str(), importBuf.length());
-        importBuf = "";
+        importBuf = String();  // release the allocation
         if (err) return r->send(400, "text/plain", err);
         JsonDocument e;
         e["ev"] = "devreload";
@@ -204,21 +237,22 @@ void web_begin() {
       },
       nullptr,
       [](AsyncWebServerRequest *r, uint8_t *data, size_t len, size_t index, size_t total) {
-        if (!authed(r)) return;
+        if (!authed(r) || total > IMPORT_MAX) return;
         if (index == 0) {
-          importBuf = "";
+          importBuf = String();
           importBuf.reserve(total);
         }
-        if (total <= 256 * 1024) importBuf.concat((const char *)data, len);
+        importBuf.concat((const char *)data, len);
       });
 
   server.on(
       "/api/update", HTTP_POST,
       [](AsyncWebServerRequest *r) {
         GUARD(r);
-        bool ok = !Update.hasError();
-        AsyncWebServerResponse *resp =
-            r->beginResponse(ok ? 200 : 500, "text/plain", ok ? "OK, rebooting" : Update.errorString());
+        bool ok = otaReceived && !Update.hasError();
+        otaReceived = false;
+        const char *msg = ok ? "OK, rebooting" : Update.hasError() ? Update.errorString() : "no firmware file received";
+        AsyncWebServerResponse *resp = r->beginResponse(ok ? 200 : (Update.hasError() ? 500 : 400), "text/plain", msg);
         resp->addHeader("Connection", "close");
         r->send(resp);
         if (ok) {
@@ -231,13 +265,22 @@ void web_begin() {
       [](AsyncWebServerRequest *r, const String &filename, size_t index, uint8_t *data, size_t len, bool final) {
         if (!authed(r)) return;
         if (index == 0) {
+          otaReceived = false;
+          if (Update.isRunning()) Update.abort();  // left over from an interrupted upload
           Serial.printf("[ota] receiving %s\n", filename.c_str());
           if (!Update.begin(UPDATE_SIZE_UNKNOWN, U_FLASH)) Update.printError(Serial);
+          r->onDisconnect([]() {
+            if (Update.isRunning()) Update.abort();
+          });
         }
         if (Update.isRunning() && Update.write(data, len) != len) Update.printError(Serial);
         if (final) {
-          if (Update.end(true)) Serial.printf("[ota] done, %u bytes\n", (unsigned)(index + len));
-          else Update.printError(Serial);
+          if (Update.isRunning() && Update.end(true)) {
+            otaReceived = true;
+            Serial.printf("[ota] done, %u bytes\n", (unsigned)(index + len));
+          } else {
+            Update.printError(Serial);
+          }
         }
       });
 

@@ -101,7 +101,7 @@ void push_loop() {
     lastTrace = now;
     push_trace(cursor);
   }
-  if (!web_client_count()) return;
+  if (!web_client_count() && !web_serial_events() && !(sub_get(CLIENT_SERIAL) & SUB_IDS)) return;
   if (now - lastDev >= 250) {
     lastDev = now;
     JsonDocument d;

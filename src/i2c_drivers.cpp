@@ -131,10 +131,12 @@ static int bme280_read(const I2cDev &d, DevValue *out, int max, bool humidity) {
       c.H4 = (int16_t)((int8_t)h[3] * 16 | (h[4] & 0x0F));
       c.H5 = (int16_t)((int8_t)h[5] * 16 | (h[4] >> 4));
       c.H6 = (int8_t)h[6];
-      xi2c_reg_write(d, 0xF2, 0x01);  // humidity oversampling x1
     }
     st.init = true;
   }
+  // Humidity oversampling x1 (rewritten each time: survives a sensor reset).
+  // ctrl_hum takes effect on the following ctrl_meas write.
+  if (humidity && !xi2c_reg_write(d, 0xF2, 0x01)) return -1;
   // forced mode, temperature and pressure oversampling x1
   if (!xi2c_reg_write(d, 0xF4, 0x25)) return -1;
   delay(10);
@@ -164,8 +166,8 @@ static int bme280_read(const I2cDev &d, DevValue *out, int max, bool humidity) {
   int n = 0;
   if (n < max) set(out[n++], "temperature", "°C", T);
   if (n < max) set(out[n++], "pressure", "hPa", P / 100.0);
-  if (humidity && n < max) {
-    int32_t adcH = (r[6] << 8) | r[7];
+  int32_t adcH = humidity ? (r[6] << 8) | r[7] : 0;
+  if (humidity && adcH != 0x8000 && n < max) {  // 0x8000: humidity measurement skipped
     double h = tFine - 76800.0;
     h = (adcH - (c.H4 * 64.0 + c.H5 / 16384.0 * h)) *
         (c.H2 / 65536.0 * (1.0 + c.H6 / 67108864.0 * h * (1.0 + c.H3 / 67108864.0 * h)));
@@ -237,6 +239,10 @@ static int aht20_read(const I2cDev &d, DevValue *out, int max) {
 static int scd4x_read(const I2cDev &d, DevValue *out, int max) {
   DrvState &st = state_for(d, "scd4x");
   if (!st.init) {
+    // The sensor ignores commands while measuring (e.g. after an ESP32 reboot
+    // with the sensor still powered): stop first, then start.
+    cmd16(d, 0x3F86);  // stop periodic measurement
+    delay(500);
     if (!cmd16(d, 0x21B1)) return -1;  // start periodic measurement (5 s interval)
     st.init = true;
     return 0;
@@ -373,9 +379,14 @@ void i2c_identify(const I2cDev &d, I2cIdent &o) {
       if (xi2c_read(d, b, 6) && crc8_sensirion(b, 2) == b[2] && crc8_sensirion(b + 3, 2) == b[5])
         return ident(o, "sht3x", "SHT3x", "Sensirion", true);
     }
-    return ident(o, "sht3x", "SHT3x / SHT4x (unconfirmed)", "Sensirion", false);
+    // Not an SHT: 0x44/0x45 are also INA219 addresses (checked below).
+    if (!(xi2c_reg_read(d, 0x00, b, 2) && be16(b) == 0x399F))
+      return ident(o, "sht3x", "SHT3x / SHT4x (unconfirmed)", "Sensirion", false);
   }
   if (a == 0x62) {
+    cmd16(d, 0x3F86);  // stop periodic measurement; serial number is only readable when idle
+    delay(500);
+    driver_reset(d);   // the driver restarts measurement on its next read
     if (cmd16(d, 0x3682)) {  // SCD4x: get serial number
       delay(2);
       if (xi2c_read(d, b, 9) && crc8_sensirion(b, 2) == b[2]) return ident(o, "scd4x", "SCD4x", "Sensirion", true);

@@ -70,6 +70,9 @@ static Job *make_job(JsonDocument &req, const ReplyTo &rt) {
   Job *j = new Job();
   j->cmd = req["cmd"].as<const char *>();
   j->args = req;
+  // "cmd" and "id" belong to the request envelope, never to job parameters.
+  j->args.remove("cmd");
+  j->args.remove("id");
   j->rt = rt;
   return j;
 }
@@ -246,7 +249,9 @@ void rpc_dispatch(JsonDocument &req, const ReplyTo &rt) {
   // ---- registry
   if (c == "dev.list") {
     JsonDocument r;
-    int bus = req["bus"].is<const char *>() ? bus_from_name(req["bus"]) : -1;
+    int bus = -1;
+    if (!req["bus"].isNull() && (bus = bus_from_name(req["bus"])) < 0)
+      return reply_err(rt, "unknown bus (rs485, can, qwiic, i2c, spi)");
     dev_list_json(r["devices"].to<JsonArray>(), bus);
     r["now"] = uptime_ms();
     return reply_ok(rt, r);
@@ -274,6 +279,7 @@ void rpc_dispatch(JsonDocument &req, const ReplyTo &rt) {
       return reply_err(rt, "protocol does not match bus");
     if (req["driver"].is<const char *>() && !driver_known(req["driver"]))
       return reply_err(rt, "unknown driver '%s'", req["driver"].as<const char *>());
+    if (req["driver"].is<const char *>() && proto != PROTO_I2C) return reply_err(rt, "drivers apply to I2C devices only");
     const char *err = dev_apply_meta(bus, proto, addr, req.as<JsonObjectConst>());
     if (err) return reply_err(rt, "%s", err);
     JsonDocument r;
@@ -287,7 +293,9 @@ void rpc_dispatch(JsonDocument &req, const ReplyTo &rt) {
     return reply_ok(rt);
   }
   if (c == "dev.clear") {
-    int b = req["bus"].is<const char *>() ? bus_from_name(req["bus"]) : -1;
+    int b = -1;
+    if (!req["bus"].isNull() && (b = bus_from_name(req["bus"])) < 0)
+      return reply_err(rt, "unknown bus (rs485, can, qwiic, i2c, spi); nothing removed");
     int n = dev_clear(b);
     JsonDocument e;
     e["ev"] = "devclear";

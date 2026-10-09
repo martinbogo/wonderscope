@@ -340,9 +340,13 @@ static void spi_identify(uint8_t cs, JsonObject out) {
     present = true;
     strlcpy(vendor, jedec_vendor(rx[1]), sizeof(vendor));
     uint8_t cap = rx[3];
-    if (cap >= 0x10 && cap <= 0x22)
-      snprintf(product, sizeof(product), "SPI flash %lu Mbit (JEDEC %02X %02X %02X)", (1UL << cap) * 8 / 1048576UL, rx[1],
-               rx[2], rx[3]);
+    if (cap >= 0x10 && cap <= 0x22) {
+      unsigned long long kbit = (1ULL << cap) * 8 / 1024;  // capacity code = log2(bytes)
+      if (kbit >= 1024)
+        snprintf(product, sizeof(product), "SPI flash %llu Mbit (JEDEC %02X %02X %02X)", kbit / 1024, rx[1], rx[2], rx[3]);
+      else
+        snprintf(product, sizeof(product), "SPI flash %llu kbit (JEDEC %02X %02X %02X)", kbit, rx[1], rx[2], rx[3]);
+    }
     else
       snprintf(product, sizeof(product), "JEDEC ID %02X %02X %02X", rx[1], rx[2], rx[3]);
   } else {

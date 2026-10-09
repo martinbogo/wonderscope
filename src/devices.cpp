@@ -66,6 +66,7 @@ void dev_init() {
     return;
   }
   File f = LittleFS.open(DEV_FILE, "r");
+  if (!f) f = LittleFS.open("/devices.tmp", "r");  // interrupted save
   if (!f) return;
   size_t n = f.size();
   char *buf = (char *)heap_caps_malloc(n + 1, MALLOC_CAP_SPIRAM);
@@ -248,8 +249,9 @@ void dev_list_json(JsonArray arr, int busFilter) {
   lock();
   for (int i = 0; i < MAX_DEVICES; i++) {
     if (!devs[i].used || (busFilter >= 0 && devs[i].bus != busFilter)) continue;
+    // Leaves pushedVer alone: a listing for one client must not suppress the
+    // change broadcast to the others.
     dev_to_json(devs[i], arr.add<JsonObject>(), false);
-    pushedVer[i] = devs[i].ver;
   }
   unlock();
 }
@@ -263,86 +265,103 @@ bool dev_get_json(uint8_t bus, uint8_t proto, uint8_t addr, JsonObject o) {
 }
 
 size_t dev_collect_changed(JsonArray arr, size_t max) {
+  // Round-robin start so busy low-index devices cannot starve the rest.
+  static int start;
   size_t n = 0;
   lock();
-  for (int i = 0; i < MAX_DEVICES && n < max; i++) {
+  int i = start;
+  for (int k = 0; k < MAX_DEVICES && n < max; k++, i = (i + 1) % MAX_DEVICES) {
     if (!devs[i].used || devs[i].ver == pushedVer[i]) continue;
     // Changed devices are sent in full so open detail panels stay live.
     dev_to_json(devs[i], arr.add<JsonObject>(), true);
     pushedVer[i] = devs[i].ver;
     n++;
   }
+  start = i;
   unlock();
   return n;
 }
 
 static const char *watch_from_json(WatchItem &w, JsonObjectConst o, uint8_t proto) {
   memset(&w, 0, sizeof(w));
+  // Parse as int and range-check before narrowing into the struct.
+  long fn = o["fn"] | (proto == PROTO_MODBUS ? 3L : 0L), addr = o["addr"] | 0L, sub = o["sub"] | 0L,
+       count = o["count"] | 1L;
   copy_str(w.name, sizeof(w.name), o["name"] | "");
-  w.fn = o["fn"] | (proto == PROTO_MODBUS ? 3 : 0);
-  w.addr = o["addr"] | 0;
-  w.sub = o["sub"] | 0;
-  w.count = o["count"] | 1;
   copy_str(w.fmt, sizeof(w.fmt), o["fmt"] | "u16");
   w.scale = o["scale"] | 1.0f;
   copy_str(w.unit, sizeof(w.unit), o["unit"] | "");
+  if (addr < 0 || addr > 0xFFFF) return "watch address must be 0..65535";
   if (proto == PROTO_MODBUS) {
-    if (w.fn < 1 || w.fn > 4) return "watch fn must be 1..4";
-    uint8_t maxCount = (w.fn <= 2) ? 64 : 8;
-    if (w.count < 1 || w.count > maxCount) return "watch count out of range (regs 1..8, bits 1..64)";
+    if (fn < 1 || fn > 4) return "watch fn must be 1..4";
+    long maxCount = (fn <= 2) ? 64 : 8;
+    if (count < 1 || count > maxCount) return "watch count out of range (regs 1..8, bits 1..64)";
   } else if (proto == PROTO_CANOPEN) {
-    w.fn = 0;
+    if (sub < 0 || sub > 255) return "sub-index must be 0..255";
+    fn = 0;
+    count = 1;
   } else if (proto == PROTO_I2C || proto == PROTO_SPI) {
-    w.fn = 0;
-    if (w.count < 1 || w.count > 16) return "watch count must be 1..16 bytes";
-    if (proto == PROTO_I2C && w.sub != 2) w.sub = 1;
-    if (w.addr > (w.sub == 2 ? 0xFFFF : 0xFF)) return "register address out of range";
+    fn = 0;
+    if (count < 1 || count > 16) return "watch count must be 1..16 bytes";
+    if (proto == PROTO_I2C && sub != 2) sub = 1;
+    if (proto == PROTO_SPI) sub = 0;
+    if (addr > (sub == 2 ? 0xFFFF : 0xFF)) return "register address out of range";
   } else {
     return "watch lists are not supported for this protocol";
   }
+  w.fn = fn;
+  w.addr = addr;
+  w.sub = sub;
+  w.count = count;
   return nullptr;
 }
 
 const char *dev_apply_meta(uint8_t bus, uint8_t proto, uint8_t addr, JsonObjectConst m) {
+  // Validate everything first: a rejected update must not create or modify a device.
+  int pollMs = -1;
+  if (!m["pollMs"].isNull()) {
+    pollMs = m["pollMs"].as<int>();
+    if (pollMs != 0 && (pollMs < 100 || pollMs > 60000)) return "pollMs must be 0 or 100..60000";
+  }
+  WatchItem tmp[MAX_WATCH];
+  int nWatch = -1;
+  if (m["watch"].is<JsonArrayConst>()) {
+    JsonArrayConst arr = m["watch"];
+    if (arr.size() > MAX_WATCH) return "too many watch items (max 16)";
+    nWatch = 0;
+    for (JsonObjectConst o : arr) {
+      const char *err = watch_from_json(tmp[nWatch], o, proto);
+      if (err) return err;
+      nWatch++;
+    }
+  }
+  uint32_t baud = 0;
+  if (proto == PROTO_MODBUS && !m["baud"].isNull()) {
+    baud = m["baud"].as<uint32_t>();
+    if (baud < 300 || baud > 1000000) return "baud must be 300..1000000";
+  }
+
   Device *d = dev_acquire(bus, proto, addr, true);
   if (!d) return "device table full";
-  const char *err = nullptr;
   if (m["label"].is<const char *>()) copy_str(d->label, sizeof(d->label), m["label"]);
   if (m["notes"].is<const char *>()) copy_str(d->notes, sizeof(d->notes), m["notes"]);
-  if (!m["pollMs"].isNull()) {
-    int p = m["pollMs"].as<int>();
-    if (p != 0 && (p < 100 || p > 60000)) err = "pollMs must be 0 or 100..60000";
-    else {
-      d->pollMs = p;
-      d->nextPollMs = 0;
-    }
+  if (pollMs >= 0) {
+    d->pollMs = pollMs;
+    d->nextPollMs = 0;
   }
-  if (!err && m["watch"].is<JsonArrayConst>()) {
-    JsonArrayConst arr = m["watch"];
-    if (arr.size() > MAX_WATCH) err = "too many watch items (max 16)";
-    else {
-      WatchItem tmp[MAX_WATCH];
-      uint8_t n = 0;
-      for (JsonObjectConst o : arr) {
-        err = watch_from_json(tmp[n], o, d->proto);
-        if (err) break;
-        n++;
-      }
-      if (!err) {
-        memcpy(d->watch, tmp, sizeof(WatchItem) * n);
-        d->nWatch = n;
-      }
-    }
+  if (nWatch >= 0) {
+    memcpy(d->watch, tmp, sizeof(WatchItem) * nWatch);
+    d->nWatch = nWatch;
   }
-  if (!err && m["driver"].is<const char *>() && d->proto == PROTO_I2C) {
+  if (m["driver"].is<const char *>() && d->proto == PROTO_I2C) {
     copy_str(d->driver, sizeof(d->driver), m["driver"]);
     d->nVals = 0;
     d->valsErr = 0;
     if (d->driver[0] && !d->pollMs) d->pollMs = 1000;
   }
-  if (!err && m["product"].is<const char *>()) copy_str(d->product, sizeof(d->product), m["product"]);
-  if (!err && d->proto == PROTO_MODBUS) {
-    if (!m["baud"].isNull()) d->baud = m["baud"].as<uint32_t>();
+  if (m["product"].is<const char *>()) copy_str(d->product, sizeof(d->product), m["product"]);
+  if (d->proto == PROTO_MODBUS) {
+    if (baud) d->baud = baud;
     if (m["parity"].is<const char *>()) {
       char c = toupper(m["parity"].as<const char *>()[0]);
       d->parity = c == 'E' ? 1 : c == 'O' ? 2 : 0;
@@ -350,7 +369,7 @@ const char *dev_apply_meta(uint8_t bus, uint8_t proto, uint8_t addr, JsonObjectC
     if (!m["stop"].isNull()) d->stop = m["stop"].as<int>() == 2 ? 2 : 1;
   }
   dev_release(d, true, true);
-  return err;
+  return nullptr;
 }
 
 bool dev_remove(uint8_t bus, uint8_t proto, uint8_t addr) {
@@ -601,8 +620,7 @@ bool dev_save_now() {
   size_t w = f.print(s);
   f.close();
   if (w != s.length()) return false;
-  LittleFS.remove(DEV_FILE);
-  return LittleFS.rename("/devices.tmp", DEV_FILE);
+  return LittleFS.rename("/devices.tmp", DEV_FILE);  // LittleFS rename replaces the target atomically
 }
 
 void dev_loop() {

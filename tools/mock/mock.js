@@ -42,7 +42,8 @@ addDev({ bus: 'qwiic', proto: 'i2c', addr: 0x76, product: 'BME280', vendor: 'Bos
 addDev({ bus: 'qwiic', proto: 'i2c', addr: 0x44, product: 'SHT4x', vendor: 'Sensirion', driver: 'sht4x', pollMs: 1000 });
 addDev({ bus: 'qwiic', proto: 'i2c', addr: 0x3C, product: 'SSD1306 / SH1106 OLED', vendor: '' });
 addDev({ bus: 'spi', proto: 'spi', addr: 10, product: 'SPI flash 128 Mbit (JEDEC EF 40 18)', vendor: 'Winbond' });
-function i2cFrame(bus, dir, addr, bytes) { counters[bus][dir ? 'rx' : 'tx']++; return [seq++, up(), bus === 'qwiic' ? 2 : 3, dir, 0, addr, hex(bytes)]; }
+// dir as the firmware: 1 = write (DIR_TX), 0 = read (DIR_RX)
+function i2cFrame(bus, dir, addr, bytes) { counters[bus][dir ? 'tx' : 'rx']++; return [seq++, up(), bus === 'qwiic' ? 2 : 3, dir, 0, addr, hex(bytes)]; }
 
 const ids = new Map();
 function canFrame(id, ext, data) {
@@ -100,10 +101,10 @@ class MockWS {
           if (d.driver === 'bme280') {
             d.values = [{ n: 'temperature', u: '°C', v: 24.2 + Math.sin(s / 12) * 1.4 }, { n: 'pressure', u: 'hPa', v: 1012.6 + Math.sin(s / 40) * 0.8 },
               { n: 'humidity', u: '%', v: 41 + Math.cos(s / 15) * 4 }];
-            if (settings.qwiic.enabled) f.push(i2cFrame('qwiic', 0, 0x76, [0xF4, 0x25]), i2cFrame('qwiic', 0, 0x76, [0xF7]), i2cFrame('qwiic', 1, 0x76, [0x51, 0x2A, 0x00, 0x82, 0x1C, 0x40, 0x6B, 0x3E]));
+            if (settings.qwiic.enabled) f.push(i2cFrame('qwiic', 1, 0x76, [0xF4, 0x25]), i2cFrame('qwiic', 1, 0x76, [0xF7]), i2cFrame('qwiic', 0, 0x76, [0x51, 0x2A, 0x00, 0x82, 0x1C, 0x40, 0x6B, 0x3E]));
           } else {
             d.values = [{ n: 'temperature', u: '°C', v: 23.9 + Math.sin(s / 11) * 1.2 }, { n: 'humidity', u: '%', v: 43 + Math.cos(s / 14) * 3.5 }];
-            if (settings.qwiic.enabled) f.push(i2cFrame('qwiic', 0, 0x44, [0xFD]), i2cFrame('qwiic', 1, 0x44, [0x66, 0x12, 0xB4, 0x6E, 0x3A, 0x5C]));
+            if (settings.qwiic.enabled) f.push(i2cFrame('qwiic', 1, 0x44, [0xFD]), i2cFrame('qwiic', 0, 0x44, [0x66, 0x12, 0xB4, 0x6E, 0x3A, 0x5C]));
           }
         }
         if (d.proto === 'j1939') d.pgns = d.addr === 0 ? [
@@ -125,7 +126,7 @@ class MockWS {
     const c = m.cmd;
     if (c === 'sub') { Object.assign(this.subs, m.topics); return ok({}); }
     if (c === 'time.set') return ok({ epoch: Date.now() });
-    if (c === 'dev.list') return ok({ devices: [...devs.values()], now: up() });
+    if (c === 'dev.list') return ok({ devices: [...devs.values()].map(({ notes, watch, pgns, ...d }) => d), now: up() });
     if (c === 'dev.get') { const d = devs.get(m.key); return d ? ok(Object.assign({ now: up() }, d)) : err('no such device'); }
     if (c === 'dev.update' || c === 'dev.add') {
       let d = devs.get(m.key);

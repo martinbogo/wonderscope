@@ -93,8 +93,8 @@ static void ids_rates() {
 }
 
 size_t can_ids_json(JsonArray arr, size_t max) {
-  static IdEntry *tmp;
-  if (!tmp) tmp = (IdEntry *)heap_caps_malloc(sizeof(IdEntry) * ID_MAX, MALLOC_CAP_SPIRAM);
+  // Per-call snapshot: called from both the web task and loop().
+  IdEntry *tmp = (IdEntry *)heap_caps_malloc(sizeof(IdEntry) * ID_MAX, MALLOC_CAP_SPIRAM);
   if (!tmp) return 0;
   int n = 0;
   xSemaphoreTake(idMtx, portMAX_DELAY);
@@ -116,6 +116,7 @@ size_t can_ids_json(JsonArray arr, size_t max) {
     r.add(hex_string(e.data, e.rtr ? 0 : (e.dlc > 8 ? 8 : e.dlc)));
     r.add(e.rtr);
   }
+  free(tmp);
   return out;
 }
 
@@ -148,19 +149,32 @@ static bool timing_for(uint32_t bps, twai_timing_config_t *t) {
   return false;
 }
 
-static void drv_uninstall() {
-  if (!installed) return;
-  twai_stop();
-  twai_driver_uninstall();
+// The driver can only be uninstalled from STOPPED or BUS_OFF. A recovery in
+// progress must finish first; if it never does (bus held dominant), keep the
+// driver installed rather than lose track of it.
+static bool drv_uninstall() {
+  if (!installed) return true;
+  twai_status_info_t s;
+  twai_get_status_info(&s);
+  for (int i = 0; i < 50 && s.state == TWAI_STATE_RECOVERING; i++) {
+    vTaskDelay(pdMS_TO_TICKS(10));
+    twai_get_status_info(&s);
+  }
+  if (s.state == TWAI_STATE_RUNNING) twai_stop();
+  if (twai_driver_uninstall() != ESP_OK) {
+    Serial.println("[can] driver busy (recovery in progress); not reconfigured");
+    return false;
+  }
   installed = false;
   recovering = false;
   memset(&twaiStat, 0, sizeof(twaiStat));
+  return true;
 }
 
 enum { MODE_SELFTEST = 2 };
 
 static bool drv_install(uint32_t bps, uint8_t mode) {
-  drv_uninstall();
+  if (!drv_uninstall()) return false;
   twai_timing_config_t t;
   if (!timing_for(bps, &t)) return false;
   twai_mode_t m = mode == CAN_MODE_LISTEN ? TWAI_MODE_LISTEN_ONLY
@@ -177,6 +191,7 @@ static bool drv_install(uint32_t bps, uint8_t mode) {
     return false;
   }
   installed = true;
+  twai_get_status_info(&twaiStat);
   curMode = mode;
   curBitrate = bps;
   return true;
@@ -226,24 +241,32 @@ uint32_t j1939_pgn_of(uint32_t id) {
 
 struct TpSession {
   bool active;
+  bool bam;        // broadcast (BAM) or connection mode (RTS/CTS addressed to us)
   uint8_t sa;
   uint32_t pgn;
   uint16_t size;
   uint8_t packets, next;
+  uint8_t ctsEnd;  // connection mode: last packet number granted by the current CTS
+  uint8_t ctsMax;  // connection mode: packets per CTS requested by the sender
   uint32_t ms;
   uint8_t buf[1785];
 };
 constexpr int TP_SLOTS = 6;
 static TpSession *tp;
 
-// Last completed multi-packet message, for jobs waiting on a TP reply.
-static struct {
+// Recently completed multi-packet messages, for jobs waiting on TP replies.
+struct TpDone {
   uint32_t seq;
   uint8_t sa;
   uint32_t pgn;
   uint16_t len;
   uint8_t data[256];
-} tpLast;
+};
+constexpr int TP_DONE = 4;
+static TpDone tpDone[TP_DONE];
+static uint32_t tpSeq;
+
+static esp_err_t can_send(uint32_t id, bool ext, bool rtr, const uint8_t *data, uint8_t dlc, bool self = false);
 
 static void split_star_fields(const uint8_t *d, size_t n, char fields[][40], int maxFields) {
   int f = 0;
@@ -262,11 +285,12 @@ static void split_star_fields(const uint8_t *d, size_t n, char fields[][40], int
 }
 
 static void tp_complete(uint8_t sa, uint32_t pgn, const uint8_t *d, uint16_t len) {
-  tpLast.sa = sa;
-  tpLast.pgn = pgn;
-  tpLast.len = len > sizeof(tpLast.data) ? sizeof(tpLast.data) : len;
-  memcpy(tpLast.data, d, tpLast.len);
-  tpLast.seq++;
+  TpDone &t = tpDone[tpSeq % TP_DONE];
+  t.seq = ++tpSeq;
+  t.sa = sa;
+  t.pgn = pgn;
+  t.len = len > sizeof(t.data) ? sizeof(t.data) : len;
+  memcpy(t.data, d, t.len);
   char f[5][40];
   Device *dev = nullptr;
   if (pgn == 65259) {  // Component Identification: make*model*serial*unit*
@@ -295,31 +319,60 @@ static void tp_complete(uint8_t sa, uint32_t pgn, const uint8_t *d, uint16_t len
   dev_j1939_pgn(sa, pgn, d, len > 8 ? 8 : len, g_settings.can.j1939Passive);
 }
 
-static void tp_frame(uint8_t sa, uint32_t pgn, const twai_message_t &m) {
-  if (!tp) return;
+// TP.CM frame from us to `da` (priority 7)
+static void tp_cm_send(uint8_t da, uint8_t ctrl, uint8_t b1, uint8_t b2, uint8_t b3, uint8_t b4, uint32_t pgn) {
+  uint8_t d[8] = {ctrl, b1, b2, b3, b4, (uint8_t)pgn, (uint8_t)(pgn >> 8), (uint8_t)(pgn >> 16)};
+  can_send((7u << 26) | (0xECu << 16) | ((uint32_t)da << 8) | g_settings.can.j1939Sa, true, false, d, 8);
+}
+
+static void tp_send_cts(TpSession &s) {
+  uint8_t left = s.packets - s.next + 1;
+  uint8_t n = left < s.ctsMax ? left : s.ctsMax;
+  s.ctsEnd = s.next + n - 1;
+  tp_cm_send(s.sa, 0x11, n, s.next, 0xFF, 0xFF, s.pgn);  // TP.CM_CTS
+}
+
+static void tp_frame(uint8_t sa, uint8_t da, uint32_t pgn, const twai_message_t &m) {
+  if (!tp || m.data_length_code != 8) return;
   uint32_t now = uptime_ms();
-  if (pgn == 0xEC00 && m.data_length_code == 8 && m.data[0] == 0x20) {  // TP.CM_BAM
+  uint8_t ourSa = g_settings.can.j1939Sa;
+  if (pgn == 0xEC00) {
+    uint8_t ctrl = m.data[0];
+    bool bam = ctrl == 0x20 && da == 0xFF;
+    bool rts = ctrl == 0x10 && da == ourSa && curMode != CAN_MODE_LISTEN;
+    if (ctrl == 0xFF) {  // connection abort
+      for (int i = 0; i < TP_SLOTS; i++)
+        if (tp[i].active && !tp[i].bam && tp[i].sa == sa) tp[i].active = false;
+      return;
+    }
+    if (!bam && !rts) return;
     int slot = -1;
     for (int i = 0; i < TP_SLOTS; i++)
-      if (tp[i].active && tp[i].sa == sa) slot = i;
+      if (tp[i].active && tp[i].sa == sa && tp[i].bam == bam) slot = i;
     for (int i = 0; slot < 0 && i < TP_SLOTS; i++)
       if (!tp[i].active || now - tp[i].ms > 2000) slot = i;
     if (slot < 0) return;
     TpSession &s = tp[slot];
-    s.active = true;
+    s.bam = bam;
     s.sa = sa;
     s.size = m.data[1] | (m.data[2] << 8);
     s.packets = m.data[3];
+    s.ctsMax = rts ? (m.data[4] ? m.data[4] : 0xFF) : 0xFF;
     s.pgn = m.data[5] | (m.data[6] << 8) | ((uint32_t)m.data[7] << 16);
     s.next = 1;
     s.ms = now;
-    if (s.size > sizeof(s.buf) || s.packets == 0) s.active = false;
-  } else if (pgn == 0xEB00 && m.data_length_code == 8) {  // TP.DT
+    // J1939-21: 9..1785 bytes, packet count must cover the size
+    s.active = s.size >= 9 && s.size <= sizeof(s.buf) && s.packets >= 1 && (uint32_t)s.packets * 7 >= s.size;
+    if (s.active && rts) tp_send_cts(s);
+    if (!s.active && rts) tp_cm_send(sa, 0xFF, 1, 0xFF, 0xFF, 0xFF, s.pgn);  // abort: already busy / invalid
+  } else if (pgn == 0xEB00) {  // TP.DT
     for (int i = 0; i < TP_SLOTS; i++) {
       TpSession &s = tp[i];
-      if (!s.active || s.sa != sa) continue;
+      // BAM data is broadcast; connection-mode data is addressed to us.
+      if (!s.active || s.sa != sa || (s.bam ? da != 0xFF : da != ourSa)) continue;
       if (m.data[0] != s.next) {
         s.active = false;
+        if (!s.bam) tp_cm_send(sa, 0xFF, 3, 0xFF, 0xFF, 0xFF, s.pgn);  // abort: bad sequence
         return;
       }
       size_t off = (size_t)(s.next - 1) * 7;
@@ -327,9 +380,11 @@ static void tp_frame(uint8_t sa, uint32_t pgn, const twai_message_t &m) {
       s.ms = now;
       if (s.next == s.packets) {
         s.active = false;
+        if (!s.bam) tp_cm_send(sa, 0x13, s.size & 0xFF, s.size >> 8, s.packets, 0xFF, s.pgn);  // end of message ack
         tp_complete(sa, s.pgn, s.buf, s.size);
       } else {
         s.next++;
+        if (!s.bam && s.next > s.ctsEnd) tp_send_cts(s);
       }
       return;
     }
@@ -406,7 +461,7 @@ static void passive(const twai_message_t &m) {
       if (!dup) claimSas[nClaims++] = sa;
     }
   }
-  if (pgn == 0xEC00 || pgn == 0xEB00) tp_frame(sa, pgn, m);
+  if (pgn == 0xEC00 || pgn == 0xEB00) tp_frame(sa, (id >> 8) & 0xFF, pgn, m);
   if (sa < 254) dev_j1939_pgn(sa, pgn, m.data, m.data_length_code, s.j1939Passive);
 }
 
@@ -452,7 +507,7 @@ static void can_idle(uint32_t ms) {
   can_wait([](const twai_message_t &) { return false; }, ms, nullptr);
 }
 
-static esp_err_t can_send(uint32_t id, bool ext, bool rtr, const uint8_t *data, uint8_t dlc, bool self = false) {
+static esp_err_t can_send(uint32_t id, bool ext, bool rtr, const uint8_t *data, uint8_t dlc, bool self) {
   if (!installed) return ESP_ERR_INVALID_STATE;
   if (curMode == CAN_MODE_LISTEN) return ESP_ERR_NOT_SUPPORTED;
   twai_message_t m = {};
@@ -494,10 +549,18 @@ static const char *sdo_status_name(int s) {
 
 static uint32_t le32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
 
+// Client-side abort so the server does not keep a half-finished transfer open.
+static void sdo_abort(uint8_t node, uint16_t idx, uint8_t sub, uint32_t code) {
+  uint8_t d[8] = {0x80, (uint8_t)idx, (uint8_t)(idx >> 8), sub,
+                  (uint8_t)code, (uint8_t)(code >> 8), (uint8_t)(code >> 16), (uint8_t)(code >> 24)};
+  can_send(0x600 + node, false, false, d, 8);
+}
+
 static int sdo_upload(uint8_t node, uint16_t idx, uint8_t sub, uint8_t *out, size_t cap, size_t *len,
-                      uint32_t *abortCode, uint16_t tmo) {
+                      uint32_t *abortCode, uint16_t tmo, bool *truncated = nullptr) {
   *len = 0;
   *abortCode = 0;
+  if (truncated) *truncated = false;
   uint8_t req[8] = {0x40, (uint8_t)idx, (uint8_t)(idx >> 8), sub, 0, 0, 0, 0};
   esp_err_t e = can_send(0x600 + node, false, false, req, 8);
   if (e != ESP_OK) return SDO_TXERR;
@@ -529,18 +592,28 @@ static int sdo_upload(uint8_t node, uint16_t idx, uint8_t sub, uint8_t *out, siz
   for (int guard = 0; guard < 200; guard++) {
     uint8_t sreq[8] = {(uint8_t)(0x60 | (toggle << 4)), 0, 0, 0, 0, 0, 0, 0};
     if (can_send(0x600 + node, false, false, sreq, 8) != ESP_OK) return SDO_TXERR;
-    if (!can_wait(isSeg, tmo, &r)) return SDO_TIMEOUT;
+    if (!can_wait(isSeg, tmo, &r)) {
+      sdo_abort(node, idx, sub, 0x05040000);  // SDO protocol timed out
+      return SDO_TIMEOUT;
+    }
     uint8_t c = r.data[0];
     if (c == 0x80) {
       *abortCode = le32(r.data + 4);
       return SDO_ABORT;
     }
-    if ((c & 0xE0) != 0x00 || ((c >> 4) & 1) != toggle) return SDO_PROTO;
+    if ((c & 0xE0) != 0x00 || ((c >> 4) & 1) != toggle) {
+      sdo_abort(node, idx, sub, ((c >> 4) & 1) != toggle ? 0x05030000 : 0x05040001);  // toggle / command specifier
+      return SDO_PROTO;
+    }
     size_t n = 7 - ((c >> 1) & 7);
-    for (size_t k = 0; k < n && *len < cap; k++) out[(*len)++] = r.data[1 + k];
+    for (size_t k = 0; k < n; k++) {
+      if (*len < cap) out[(*len)++] = r.data[1 + k];
+      else if (truncated) *truncated = true;
+    }
     if (c & 0x01) return SDO_OK;
     toggle ^= 1;
   }
+  sdo_abort(node, idx, sub, 0x05040005);  // object too large for this client
   return SDO_PROTO;
 }
 
@@ -755,7 +828,8 @@ static void job_sdo_read(Job *j) {
   uint8_t buf[256];
   size_t n;
   uint32_t ab;
-  int st = sdo_upload(node, idx, sub, buf, sizeof(buf), &n, &ab, a["timeoutMs"] | g_settings.can.sdoTimeoutMs);
+  bool trunc = false;
+  int st = sdo_upload(node, idx, sub, buf, sizeof(buf), &n, &ab, a["timeoutMs"] | g_settings.can.sdoTimeoutMs, &trunc);
   if (st == SDO_OK || st == SDO_ABORT) dev_seen(BUS_CAN, PROTO_CANOPEN, node, false);
   else if (st == SDO_TIMEOUT) dev_failed(BUS_CAN, PROTO_CANOPEN, node);
   JsonDocument res;
@@ -768,6 +842,7 @@ static void job_sdo_read(Job *j) {
   }
   if (st != SDO_OK) return reply_err(j->rt, "%s", sdo_status_name(st));
   res["size"] = n;
+  if (trunc) res["truncated"] = true;  // object larger than 256 bytes; first 256 returned
   res["hex"] = hex_string(buf, n);
   if (n <= 4) {
     uint32_t v = 0;
@@ -817,17 +892,17 @@ static void job_sdo_write(Job *j) {
 static void job_nmt(Job *j) {
   JsonObjectConst a = j->args.as<JsonObjectConst>();
   int node = a["node"] | -1;
-  const char *c = a["cmd"] | "";
+  const char *c = a["nmt"] | "";
   uint8_t cs = !strcmp(c, "start") ? 0x01 : !strcmp(c, "stop") ? 0x02 : !strcmp(c, "preop") ? 0x80
                : !strcmp(c, "reset") ? 0x81 : !strcmp(c, "resetcomm") ? 0x82 : 0;
-  if (!cs) return reply_err(j->rt, "cmd must be start|stop|preop|reset|resetcomm");
+  if (!cs) return reply_err(j->rt, "nmt must be start|stop|preop|reset|resetcomm");
   if (node < 0 || node > 127) return reply_err(j->rt, "node must be 0..127 (0 = all)");
   uint8_t d[2] = {cs, (uint8_t)node};
   esp_err_t e = can_send(0x000, false, false, d, 2);
   if (e != ESP_OK) return reply_err(j->rt, "%s", send_err(e));
   JsonDocument res;
   res["node"] = node;
-  res["cmd"] = c;
+  res["nmt"] = c;
   reply_ok(j->rt, res);
 }
 
@@ -865,38 +940,43 @@ static void job_j1939_request(Job *j) {
   if (da < 0 || da > 255) return reply_err(j->rt, "da must be 0..255");
   uint16_t tmo = a["timeoutMs"] | 1250;
   uint8_t req[3] = {(uint8_t)pgn, (uint8_t)(pgn >> 8), (uint8_t)(pgn >> 16)};
-  uint32_t tpSeq = tpLast.seq;
+  uint32_t seen = tpSeq;
   esp_err_t e = can_send(j1939_id(6, 0xEA00, da, g_settings.can.j1939Sa), true, false, req, 3);
   if (e != ESP_OK) return reply_err(j->rt, "%s", send_err(e));
   JsonDocument res;
   res["pgn"] = pgn;
   res["da"] = da;
   JsonArray rs = res["responses"].to<JsonArray>();
+  bool done = false;
   uint64_t deadline = uptime_us() + (uint64_t)tmo * 1000;
-  while (uptime_us() < deadline) {
+  while (!done) {
+    uint64_t now = uptime_us();
+    if (now >= deadline) break;
+    uint32_t left = (uint32_t)((deadline - now) / 1000) + 1;
     twai_message_t m;
-    uint32_t left = (uint32_t)((deadline - uptime_us()) / 1000) + 1;
+    // Wake for a single-frame answer or for any completed multi-packet message.
     bool got = can_wait(
         [&](const twai_message_t &mm) {
+          if (tpSeq != seen) return true;
           return mm.extd && j1939_pgn_of(mm.identifier) == (uint32_t)pgn &&
                  (da == 255 || (mm.identifier & 0xFF) == (uint32_t)da);
         },
         left, &m);
-    if (tpLast.seq != tpSeq) {  // a multi-packet answer completed
-      tpSeq = tpLast.seq;
-      if (tpLast.pgn == (uint32_t)pgn && (da == 255 || tpLast.sa == da)) {
-        JsonObject o = rs.add<JsonObject>();
-        o["sa"] = tpLast.sa;
-        o["data"] = hex_string(tpLast.data, tpLast.len);
-        o["tp"] = true;
-        if (da != 255) break;
-      }
+    // Collect every multi-packet answer completed since the last check.
+    for (; seen != tpSeq; seen++) {
+      const TpDone &t = tpDone[seen % TP_DONE];
+      if (t.seq != seen + 1 || t.pgn != (uint32_t)pgn || (da != 255 && t.sa != da)) continue;
+      JsonObject o = rs.add<JsonObject>();
+      o["sa"] = t.sa;
+      o["data"] = hex_string(t.data, t.len);
+      o["tp"] = true;
+      if (da != 255) done = true;
     }
-    if (got) {
+    if (got && j1939_pgn_of(m.identifier) == (uint32_t)pgn && (da == 255 || (m.identifier & 0xFF) == (uint32_t)da)) {
       JsonObject o = rs.add<JsonObject>();
       o["sa"] = m.identifier & 0xFF;
       o["data"] = hex_string(m.data, m.data_length_code);
-      if (da != 255) break;
+      if (da != 255) done = true;
     }
     if (!got) break;
   }
@@ -921,7 +1001,7 @@ static void job_j1939_send(Job *j) {
 
 static void job_send(Job *j) {
   JsonObjectConst a = j->args.as<JsonObjectConst>();
-  long id = a["id"] | -1L;
+  long id = a["canId"] | -1L;
   bool ext = a["ext"] | (id > 0x7FF);
   bool rtr = a["rtr"] | false;
   if (id < 0 || id > (ext ? 0x1FFFFFFF : 0x7FF)) return reply_err(j->rt, "id out of range");
@@ -942,7 +1022,13 @@ static void job_send(Job *j) {
       return reply_err(j->rt, "after %d frames: %s", sent, send_err(e));
     }
     sent++;
-    if (interval && i + 1 < count) can_idle(interval);
+    if (interval && i + 1 < count) {
+      can_idle(interval);
+    } else {
+      // Keep receiving during back-to-back bursts so the RX queue cannot overflow.
+      twai_message_t m;
+      while (twai_receive(&m, 0) == ESP_OK) on_rx(m);
+    }
   }
   busy = "";
   JsonDocument res;
@@ -1007,7 +1093,8 @@ static void job_autobaud(Job *j) {
 // frame on the bus, so it is only run on explicit request.
 static void job_selftest(Job *j) {
   JsonObjectConst a = j->args.as<JsonObjectConst>();
-  uint32_t id = a["id"] | 0x7FFu;  // outside CANopen's predefined IDs (LSS uses 7E4/7E5)
+  uint32_t id = a["canId"] | 0x7FFu;  // outside CANopen's predefined IDs (LSS uses 7E4/7E5)
+  if (id > 0x7FF) id = 0x7FF;
   if (!drv_install(g_settings.can.bitrate, MODE_SELFTEST)) {
     apply_settings();
     return reply_err(j->rt, "could not start TWAI in self-test mode");
