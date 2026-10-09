@@ -1,0 +1,10 @@
+# Build output
+.pio/
+src/generated/
+
+# Local tooling
+.claude/
+.vscode/
+
+# Vendor firmware backup (Waveshare factory image)
+backup/

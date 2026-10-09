@@ -1,0 +1,25 @@
+<!doctype html>
+<!-- Dashboard with a simulated backend: serve the project root and open /tools/mock/ -->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>WonderScope (mock)</title>
+<link rel="stylesheet" href="../../web/style.css">
+<script src="mock.js"></script>
+</head>
+<body>
+<script>
+  // Pull in the real dashboard markup so the mock always matches the firmware's page.
+  fetch('../../web/index.html').then(r => r.text()).then(html => {
+    const doc = new DOMParser().parseFromString(html, 'text/html');
+    doc.querySelectorAll('script').forEach(s => s.remove());
+    document.body.innerHTML = doc.body.innerHTML;
+    try { const t = localStorage.getItem('bs.theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
+    document.querySelector('link[rel=stylesheet]').href = '../../web/style.css?' + Date.now();
+    const s = document.createElement('script'); s.src = '../../web/app.js?' + Date.now(); document.body.append(s);
+  });
+</script>
+</body>
+</html>

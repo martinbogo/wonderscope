@@ -1,0 +1,71 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>WonderScope</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%232563eb'/%3E%3Cpath d='M5 12h22M5 20h22' stroke='white' stroke-width='2.5'/%3E%3Ccircle cx='11' cy='12' r='3' fill='white'/%3E%3Ccircle cx='21' cy='20' r='3' fill='white'/%3E%3C/svg%3E">
+<link rel="stylesheet" href="style.css">
+<script>
+  // Apply the saved theme before first paint to avoid a flash.
+  try { var t = localStorage.getItem('bs.theme'); if (t === 'light' || t === 'dark') document.documentElement.dataset.theme = t; } catch (e) {}
+</script>
+</head>
+<body>
+<header class="topbar">
+  <div class="brand">
+    <svg viewBox="0 0 32 32" aria-hidden="true"><rect width="32" height="32" rx="7" class="brand-bg"/><path d="M5 12h22M5 20h22" stroke="#fff" stroke-width="2.5"/><circle cx="11" cy="12" r="3" fill="#fff"/><circle cx="21" cy="20" r="3" fill="#fff"/></svg>
+    <span>WonderScope</span>
+  </div>
+  <div class="conn" id="conn" title="Connection to the board"><span class="dot"></span><span id="connText">Connecting…</span></div>
+  <div class="bus-pills">
+    <div class="pill" data-bus="rs485" id="pill-rs485">
+      <label class="switch" title="Enable / disable RS485"><input type="checkbox" data-act="toggle-bus" data-bus="rs485"><span></span></label>
+      <div class="pill-text"><b>RS485</b><small id="pill-rs485-sub">—</small></div>
+      <span class="led" id="led-rs485"></span>
+    </div>
+    <div class="pill" data-bus="can" id="pill-can">
+      <label class="switch" title="Enable / disable CAN"><input type="checkbox" data-act="toggle-bus" data-bus="can"><span></span></label>
+      <div class="pill-text"><b>CAN</b><small id="pill-can-sub">—</small></div>
+      <span class="led" id="led-can"></span>
+    </div>
+  </div>
+  <button class="icon-btn" id="themeBtn" title="Theme: auto" aria-label="Toggle theme">
+    <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18V3z" fill="currentColor"/><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" stroke-width="2"/></svg>
+  </button>
+</header>
+
+<nav class="tabs" role="tablist">
+  <button role="tab" data-view="map" class="active">Map</button>
+  <button role="tab" data-view="grid">Address grid</button>
+  <button role="tab" data-view="traffic">Traffic</button>
+  <button role="tab" data-view="ids">CAN IDs</button>
+  <button role="tab" data-view="console">Console</button>
+  <button role="tab" data-view="settings">Settings</button>
+</nav>
+
+<div class="banner" id="offline" hidden>Disconnected from the board — reconnecting…</div>
+
+<main id="main">
+  <section class="view active" id="view-map"></section>
+  <section class="view" id="view-grid"></section>
+  <section class="view" id="view-traffic"></section>
+  <section class="view" id="view-ids"></section>
+  <section class="view" id="view-console"></section>
+  <section class="view" id="view-settings"></section>
+</main>
+
+<aside class="drawer" id="drawer" aria-hidden="true">
+  <div class="drawer-inner" id="drawerInner"></div>
+</aside>
+<div class="scrim" id="scrim"></div>
+
+<footer class="statusbar" id="statusbar"></footer>
+
+<div class="toasts" id="toasts" aria-live="polite"></div>
+<dialog id="modal"><form method="dialog" id="modalForm"></form></dialog>
+
+<script src="app.js"></script>
+</body>
+</html>
