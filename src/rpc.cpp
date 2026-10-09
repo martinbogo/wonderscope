@@ -31,6 +31,14 @@ void status_json(JsonObject o) {
   o["traceHead"] = trace_head();
 }
 
+void state_changed() {
+  JsonDocument e;
+  e["ev"] = "state";
+  status_json(e["s"].to<JsonObject>());
+  settings_to_json(e["settings"].to<JsonObject>());
+  event_send(e);
+}
+
 void hello_json(JsonObject o) {
   o["fw"] = FW_NAME;
   o["version"] = FW_VERSION;
@@ -136,6 +144,7 @@ void rpc_dispatch(JsonDocument &req, const ReplyTo &rt) {
     if (err) return reply_err(rt, "%s", err);
     settings_save();
     wifiApplyAtMs = uptime_ms() + 1500;  // after the reply is sent
+    state_changed();
     JsonDocument r;
     r["note"] = "Wi-Fi settings saved; restarting Wi-Fi";
     return reply_ok(rt, r);
@@ -144,6 +153,7 @@ void rpc_dispatch(JsonDocument &req, const ReplyTo &rt) {
     const char *err = auth_settings_from_json(g_settings.auth, req.as<JsonObjectConst>());
     if (err) return reply_err(rt, "%s", err);
     settings_save();
+    state_changed();
     JsonDocument r;
     r["enabled"] = g_settings.auth.pass[0] != 0;
     r["user"] = g_settings.auth.user;

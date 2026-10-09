@@ -369,6 +369,7 @@ function onMessage(m) {
   switch (m.ev) {
     case 'hello': onHello(m.d); break;
     case 'status': onStatus(m.s); break;
+    case 'state': onStatus(m.s); onSettings(m.settings); break;
     case 'dev': onDevices(m.d, m.now); break;
     case 'devdel': for (const k of m.keys) { S.devices.delete(k); if (S.selected === k) closeDrawer(); } scheduleRender(); break;
     case 'devclear': for (const [k, d] of S.devices) if (!m.bus || d.bus === m.bus) S.devices.delete(k); scheduleRender(); break;
@@ -418,14 +419,26 @@ function onStatus(s) {
     }
   }
   S.lastCounters = { t: now, rr: s.rs485.rx, rt: s.rs485.tx, re: s.rs485.err, cr: s.can.rx, ct: s.can.tx, ce: s.can.busErrors };
-  const modeChanged = S.status && S.status.can.mode !== s.can.mode;
+  const prevMode = S.status ? S.status.can.mode : undefined;
   S.status = s;
-  if (modeChanged && S.selected) renderDrawer();
   S.serverNow = s.up; S.serverNowAt = now;
-  renderHeader(); renderStatusbar(); renderBusHeads();
+  refreshBusViews(prevMode);
+}
+// Single update path for every view of bus/system configuration (header
+// toggles, map cards, Settings, device panel). New views must hook in here.
+function refreshBusViews(prevMode) {
+  renderHeader(); renderStatusbar(); renderBusHeads(); syncForms();
   if (S.view === 'grid') renderGrid();
   if (S.view === 'map') scheduleRender();
-  if (S.selected) updateDrawerLive();
+  if (S.selected) {
+    if (prevMode !== undefined && prevMode !== busCfg('can').mode) renderDrawer();
+    else updateDrawerLive();
+  }
+}
+function onSettings(st) {
+  if (!S.hello || !st) return;
+  S.hello.settings = st;
+  syncForms();
 }
 function blink(bus, rx, err) {
   const led = $('#led-' + bus);
@@ -971,10 +984,9 @@ async function setCanMode(mode) {
 // immediately instead of waiting for the next status push.
 function applyBusStatus(bus, r) {
   if (!S.status || !r || r.enabled === undefined) return;
-  const modeChanged = bus === 'can' && S.status.can.mode !== r.mode;
+  const prevMode = S.status.can.mode;
   Object.assign(S.status[bus], r);
-  renderHeader(); renderBusHeads(); scheduleRender();
-  if (modeChanged && S.selected) renderDrawer();
+  refreshBusViews(prevMode);
 }
 
 async function busConfigDialog(bus) {
@@ -1662,6 +1674,21 @@ const Console = {
 // =====================================================================
 // Settings view
 // =====================================================================
+// Keep Settings forms in step with the board's configuration, leaving fields
+// with unapplied edits (or focus) untouched. Password fields are not synced.
+function syncForms() {
+  if (!S.form || !S.hello) return;
+  const src = { rs485: busCfg('rs485'), can: busCfg('can'), wifi: S.hello.settings.wifi, auth: S.hello.settings.auth };
+  for (const [group, fields] of Object.entries(S.form)) {
+    const cfg = src[group] || {};
+    for (const [key, el] of Object.entries(fields)) {
+      if (cfg[key] === undefined || el.dataset.dirty || document.activeElement === el) continue;
+      if (el.type === 'checkbox') el.checked = !!cfg[key];
+      else if (el.value !== String(cfg[key])) el.value = String(cfg[key]);
+    }
+  }
+}
+
 function renderSettings() {
   const v = $('#view-settings');
   if (!S.hello) { v.replaceChildren(h('p', { class: 'muted' }, 'Connecting…')); return; }
@@ -1669,7 +1696,15 @@ function renderSettings() {
   v.dataset.built = '1';
   const st = S.hello.settings, r = busCfg('rs485'), c = busCfg('can');
   const field = (label, input, hint) => h('label', { class: 'field' }, h('span', null, label), input, hint ? h('small', { class: 'faint' }, hint) : null);
-  const save = (cmd, get, msg) => async () => { try { await call(cmd, get()); toast(msg || 'Saved', 'ok'); const s = await call('settings.get'); S.hello.settings = s; } catch (e) { fail(e); } };
+  const save = (cmd, get, msg) => async () => {
+    try {
+      await call(cmd, get());
+      const group = cmd.split('.')[0];
+      if (S.form[group]) for (const el of Object.values(S.form[group])) delete el.dataset.dirty;
+      onSettings(await call('settings.get'));
+      toast(msg || 'Saved', 'ok');
+    } catch (e) { fail(e); }
+  };
 
   // RS485
   const rBaud = h('input', { type: 'number', value: r.baud, min: 300, max: 1000000 });
@@ -1698,6 +1733,25 @@ function renderSettings() {
   const host = h('input', { value: w.hostname, maxlength: 32 });
   // Auth
   const aUser = h('input', { value: st.auth.user, maxlength: 16 });
+  S.form = {
+    rs485: { enabled: rEn, baud: rBaud, parity: rPar, stop: rStop, timeoutMs: rTmo, scanTimeoutMs: rScan },
+    can: { enabled: cEn, bitrate: cBr, mode: cMode, autoRecover: cRec, canopenPassive: cCo, j1939Passive: cJ, j1939Sa: cSa, sdoTimeoutMs: cSdo, scanTimeoutMs: cScan },
+    wifi: { apSsid, staSsid, hostname: host },
+    auth: { user: aUser },
+  };
+  for (const fields of Object.values(S.form))
+    for (const el of Object.values(fields)) {
+      const mark = () => { el.dataset.dirty = '1'; };
+      el.addEventListener('input', mark); el.addEventListener('change', mark);
+    }
+  const clean = group => { for (const el of Object.values(S.form[group])) delete el.dataset.dirty; syncForms(); };
+  const applyBus = async (bus, args, msg) => {
+    try {
+      applyBusStatus(bus, await call(bus + '.config', args));
+      clean(bus);
+      toast(msg, 'ok');
+    } catch (e) { if (e.message !== 'Cancelled') fail(e); }
+  };
   const aPass = h('input', { type: 'password', placeholder: st.auth.enabled ? '(unchanged)' : 'none', maxlength: 32 });
   const theme = h('select', { id: 'themeSelect' }, THEMES.map(t => h('option', { value: t, selected: t === currentTheme() }, { auto: 'Automatic (follow system)', light: 'Light', dark: 'Dark' }[t])));
   theme.addEventListener('change', () => applyTheme(theme.value));
@@ -1717,7 +1771,7 @@ function renderSettings() {
       h('label', { class: 'check' }, rEn, 'Enabled'),
       h('div', { class: 'form-grid' }, field('Baud rate', rBaud), field('Parity', rPar), field('Stop bits', rStop),
         field('Response timeout (ms)', rTmo), field('Scan timeout per address (ms)', rScan)),
-      h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: save('rs485.config', () => ({ enabled: rEn.checked, baud: +rBaud.value, parity: rPar.value, stop: +rStop.value, timeoutMs: +rTmo.value, scanTimeoutMs: +rScan.value }), 'RS485 settings applied') }, 'Apply')),
+      h('div', { class: 'row' }, h('button', { class: 'btn primary', onclick: () => applyBus('rs485', { enabled: rEn.checked, baud: +rBaud.value, parity: rPar.value, stop: +rStop.value, timeoutMs: +rTmo.value, scanTimeoutMs: +rScan.value }, 'RS485 settings applied') }, 'Apply')),
       h('p', { class: 'hint' }, 'Termination: fit jumper H2 (120 Ω) only at a line end.')),
     card('CAN port',
       h('label', { class: 'check' }, cEn, 'Enabled'),
@@ -1728,11 +1782,8 @@ function renderSettings() {
       h('label', { class: 'check' }, cJ, 'Discover J1939 ECUs passively (29-bit traffic)'),
       h('div', { class: 'row' },
         h('button', { class: 'btn primary', onclick: async () => {
-          try {
-            if (cMode.value === 'normal' && !canActive()) await setCanMode('normal');
-            await call('can.config', { enabled: cEn.checked, bitrate: +cBr.value, mode: cMode.value, autoRecover: cRec.checked, canopenPassive: cCo.checked, j1939Passive: cJ.checked, j1939Sa: +cSa.value, sdoTimeoutMs: +cSdo.value, scanTimeoutMs: +cScan.value });
-            toast('CAN settings applied', 'ok');
-          } catch (e) { if (e.message !== 'Cancelled') fail(e); }
+          try { if (cMode.value === 'normal' && !canActive()) await setCanMode('normal'); } catch (e) { if (e.message !== 'Cancelled') fail(e); return; }
+          applyBus('can', { enabled: cEn.checked, bitrate: +cBr.value, mode: cMode.value, autoRecover: cRec.checked, canopenPassive: cCo.checked, j1939Passive: cJ.checked, j1939Sa: +cSa.value, sdoTimeoutMs: +cSdo.value, scanTimeoutMs: +cScan.value }, 'CAN settings applied');
         } }, 'Apply'),
         h('button', { class: 'btn', onclick: autobaud }, 'Detect bitrate'),
         h('button', { class: 'btn', onclick: () => call('can.recover').then(() => toast('CAN controller restarted', 'ok')).catch(fail) }, 'Restart controller'),

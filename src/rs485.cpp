@@ -10,6 +10,7 @@
 
 #include "devices.h"
 #include "modbus.h"
+#include "rpc.h"
 #include "settings.h"
 #include "trace.h"
 
@@ -577,7 +578,8 @@ static void run_job(Job *j) {
     apply_settings();
     JsonDocument res;
     rs485_status_json(res.to<JsonObject>());
-    return reply_ok(j->rt, res);
+    reply_ok(j->rt, res);
+    return state_changed();
   }
   if (!up) return reply_err(j->rt, "RS485 disabled");
   if (c == "scan") job_scan(j);

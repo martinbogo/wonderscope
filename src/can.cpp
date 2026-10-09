@@ -16,6 +16,7 @@
 #include <algorithm>
 
 #include "devices.h"
+#include "rpc.h"
 #include "settings.h"
 #include "trace.h"
 
@@ -1039,10 +1040,17 @@ static void run_job(Job *j) {
     apply_settings();
     JsonDocument res;
     can_status_json(res.to<JsonObject>());
-    return reply_ok(j->rt, res);
+    reply_ok(j->rt, res);
+    return state_changed();
   }
-  if (c == "can.autobaud") return job_autobaud(j);
-  if (c == "can.selftest") return job_selftest(j);
+  if (c == "can.autobaud") {
+    job_autobaud(j);
+    return state_changed();
+  }
+  if (c == "can.selftest") {
+    job_selftest(j);
+    return state_changed();
+  }
   if (c == "can.recover") {
     if (!installed) return reply_err(j->rt, "CAN is disabled");
     if (twaiStat.state != TWAI_STATE_BUS_OFF) {
@@ -1051,7 +1059,8 @@ static void run_job(Job *j) {
       twai_initiate_recovery();
       recovering = true;
     }
-    return reply_ok(j->rt);
+    reply_ok(j->rt);
+    return state_changed();
   }
   if (c == "scan") {
     const char *p = j->args["proto"] | "canopen";
