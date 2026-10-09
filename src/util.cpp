@@ -3,22 +3,24 @@
 
 #include "common.h"
 
-static const char *const BUS_NAMES[] = {"rs485", "can"};
-static const char *const PROTO_NAMES[] = {"modbus", "canopen", "j1939"};
+static const char *const BUS_NAMES[] = {"rs485", "can", "qwiic", "i2c", "spi"};
+static const char *const PROTO_NAMES[] = {"modbus", "canopen", "j1939", "i2c", "spi"};
+constexpr int N_BUS = sizeof(BUS_NAMES) / sizeof(BUS_NAMES[0]);
+constexpr int N_PROTO = sizeof(PROTO_NAMES) / sizeof(PROTO_NAMES[0]);
 
-const char *bus_name(uint8_t bus) { return bus < 2 ? BUS_NAMES[bus] : "?"; }
-const char *proto_name(uint8_t proto) { return proto < 3 ? PROTO_NAMES[proto] : "?"; }
+const char *bus_name(uint8_t bus) { return bus < N_BUS ? BUS_NAMES[bus] : "?"; }
+const char *proto_name(uint8_t proto) { return proto < N_PROTO ? PROTO_NAMES[proto] : "?"; }
 
 int bus_from_name(const char *s) {
   if (!s) return -1;
-  for (int i = 0; i < 2; i++)
+  for (int i = 0; i < N_BUS; i++)
     if (!strcmp(s, BUS_NAMES[i])) return i;
   return -1;
 }
 
 int proto_from_name(const char *s) {
   if (!s) return -1;
-  for (int i = 0; i < 3; i++)
+  for (int i = 0; i < N_PROTO; i++)
     if (!strcmp(s, PROTO_NAMES[i])) return i;
   return -1;
 }

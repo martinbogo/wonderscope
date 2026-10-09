@@ -13,7 +13,8 @@ Web dashboard served by the board, plus a text console on USB serial and in the 
 - **RS485 / Modbus RTU** — passive sniffing, address scan with baud/parity sweep, device identification (FC2B/0E, FC11), register and coil read/write, raw frames.
 - **CAN** — listen-only by default, bitrate detection, identifier map, CANopen (SDO, NMT, heartbeat, EMCY, identity), J1939 (address claim, PGN requests, BAM reassembly), raw frames.
 - **Devices** — topology map and address grid per bus, labels, notes, per-device link settings, polled watch lists. Stored on the board.
-- **Traffic** — live decoded trace for both buses, filter, CSV export.
+- **I²C and SPI expansion** — Qwiic connector and internal pin header: scanning, identification, decoding drivers for common sensors, register access, live graphs.
+- **Traffic** — live decoded trace for every bus, filter, CSV export.
 - **Console** — every function as a command, on USB serial and in the dashboard.
 - **System** — Wi-Fi AP + station, mDNS, optional login, OTA update, RTC time. Light and dark themes.
 
@@ -25,6 +26,8 @@ Web dashboard served by the board, plus a text console on USB serial and in the 
 | **Device panel** — Modbus watch list with live values and trends | **CANopen node** — identity, device profile, NMT state, last EMCY |
 | ![Live traffic with Modbus, CANopen and J1939 decoding](docs/images/traffic-dark.png) | ![Console with status, device list, Modbus and SDO reads](docs/images/console-dark.png) |
 | **Traffic** — RS485 and CAN frames decoded as Modbus, CANopen and J1939 | **Console** — the same commands as USB serial |
+| ![Qwiic, header I2C and SPI buses with identified devices](docs/images/expansion-dark.png) | ![BME280 on Qwiic with decoded values and trend graph](docs/images/i2c-values-light.png) |
+| **Expansion buses** — Qwiic, header I²C and SPI with identified devices | **I²C sensor** — decoded values with a live graph |
 
 ![Modbus address grid](docs/images/grid-light.png)
 **Address grid** — every Modbus address (and CANopen node / J1939 source address); select an empty address to probe it.
@@ -68,6 +71,49 @@ DIN-rail module: ESP32-S3R8 (8 MB PSRAM), 16 MB flash, isolated RS485 and CAN, 7
 Termination: fit the 120 Ω jumper only when the board is at a line end.
 
 <sub>Hardware images © Waveshare, from the [ESP32-S3-RS485-CAN wiki](https://www.waveshare.com/wiki/ESP32-S3-RS485-CAN). Not covered by this project's license.</sub>
+
+## I²C and SPI expansion
+
+| Bus | Connection | Pins | Default |
+|---|---|---|---|
+| Qwiic I²C | SH1.0 connector beside USB-C (Qwiic / STEMMA QT) | SDA IO2, SCL IO1 | enabled |
+| Header I²C | 2×10 pin header inside the case | SDA IO8, SCL IO9 | disabled |
+| SPI | 2×10 pin header inside the case | SCK IO12, MOSI IO11, MISO IO13, CS IO10 | disabled |
+
+Qwiic devices are detected automatically when plugged in. Header I²C and SPI need wiring to the internal header and are enabled in Settings or with `i2c header on` / `spi on`. Additional SPI chip selects can be assigned to IO3–IO8 and IO14.
+
+```
+Qwiic connector (SH1.0, beside USB-C)
+  GND   3V3   SDA = IO2   SCL = IO1
+
+Pin header, 2x10, 2.0 mm pitch (inside the case; power terminal end at top)
+
+                    3V3   o o   5V
+                    GND   o o   GND
+        UART0 TX   IO43   o o   IO20   USB D+  (do not use)
+        UART0 RX   IO44   o o   IO19   USB D-  (do not use)
+        SPI CS*     IO3   o o   IO14   SPI CS*
+        SPI CS*     IO4   o o   IO13   SPI MISO
+        SPI CS*     IO5   o o   IO12   SPI SCK
+        SPI CS*     IO6   o o   IO11   SPI MOSI
+        SPI CS*     IO7   o o   IO10   SPI CS (default)
+        I2C SDA     IO8   o o   IO9    I2C SCL
+
+  * optional additional chip selects
+```
+
+The expansion pins use 3.3 V logic, are not 5 V tolerant and are not isolated from the ESP32. The 5V header pin is a supply output. Internal I²C pull-ups are weak; fit 2.2–4.7 kΩ to 3V3 for long or fast buses (most Qwiic boards include them).
+
+Decoding drivers, assigned automatically when a device is identified: BME280, BMP280, SHT3x, SHT4x, AHT20/21, BH1750, TMP102, MCP9808, INA219, MPU-6050, MPU-6500/9250, SCD40/41. Other devices are read through the Registers and Watch tabs. SPI scans identify JEDEC flash chips and common sensors by ID register.
+
+```
+i2c scan                      probe the Qwiic bus and identify devices
+i2c read qwiic 0x76 0xD0 1    read one register
+dev driver qwiic:0x76 bme280  set a decoding driver
+spi on 4m cs 10               enable SPI
+spi xfer 10 9F 00 00 00       JEDEC ID read
+pins                          pin diagram
+```
 
 ## Access
 

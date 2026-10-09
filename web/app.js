@@ -263,10 +263,31 @@ function decodeModbus(b, crcOk) {
 const MB_FMTS = { u16: 'Unsigned 16', s16: 'Signed 16', u32: 'Unsigned 32 (hi word first)', u32sw: 'Unsigned 32 (lo word first)', s32: 'Signed 32 (hi first)', s32sw: 'Signed 32 (lo first)', f32: 'Float 32 (hi first)', f32sw: 'Float 32 (lo first)', hex: 'Hex', str: 'ASCII', bool: 'Bit / boolean' };
 const CO_FMTS = { u8: 'UNSIGNED8', u16: 'UNSIGNED16', u32: 'UNSIGNED32', i8: 'INTEGER8', i16: 'INTEGER16', i32: 'INTEGER32', f32: 'REAL32', str: 'VISIBLE_STRING', hex: 'Hex' };
 const FMT_WORDS = { u16: 1, s16: 1, u32: 2, u32sw: 2, s32: 2, s32sw: 2, f32: 2, f32sw: 2, hex: 1, str: 4, bool: 1 };
+// I2C / SPI register formats (byte order explicit)
+const RAW_FMTS = { u8: 'Unsigned 8', s8: 'Signed 8', u16be: 'Unsigned 16 BE', u16le: 'Unsigned 16 LE', s16be: 'Signed 16 BE', s16le: 'Signed 16 LE', u32be: 'Unsigned 32 BE', u32le: 'Unsigned 32 LE', s32be: 'Signed 32 BE', f32be: 'Float 32 BE', f32le: 'Float 32 LE', hex: 'Hex', str: 'ASCII' };
+const FMT_BYTES = { u8: 1, s8: 1, u16be: 2, u16le: 2, s16be: 2, s16le: 2, u32be: 4, u32le: 4, s32be: 4, f32be: 4, f32le: 4, hex: 2, str: 8 };
+const isRawProto = p => p === 'i2c' || p === 'spi';
 
 function decodeValue(fmt, bytes, proto, fn) {
   if (!bytes || !bytes.length) return null;
   const dv = new DataView(new Uint8Array(bytes.concat([0, 0, 0, 0])).buffer);
+  if (isRawProto(proto)) {
+    switch (fmt) {
+      case 'u8': return dv.getUint8(0);
+      case 's8': return dv.getInt8(0);
+      case 'u16be': return dv.getUint16(0);
+      case 'u16le': return dv.getUint16(0, true);
+      case 's16be': return dv.getInt16(0);
+      case 's16le': return dv.getInt16(0, true);
+      case 'u32be': return dv.getUint32(0);
+      case 'u32le': return dv.getUint32(0, true);
+      case 's32be': return dv.getInt32(0);
+      case 'f32be': return dv.getFloat32(0);
+      case 'f32le': return dv.getFloat32(0, true);
+      case 'str': return String.fromCharCode(...bytes.filter(c => c >= 32 && c < 127));
+      default: return bytes.map(hex2).join(' ');
+    }
+  }
   if (proto === 'modbus') {
     if (fn === 1 || fn === 2) return fmt === 'hex' ? bytes.map(hex2).join(' ') : (bytes[0] & 1);
     const sw = () => new DataView(new Uint8Array([bytes[2], bytes[3], bytes[0], bytes[1]]).buffer);
@@ -314,13 +335,20 @@ const S = {
   devices: new Map(), serverNow: 0, serverNowAt: 0,
   rates: { rs485: 0, can: 0, rs485tx: 0, cantx: 0 }, lastCounters: null,
   view: 'map', selected: null, drawerTab: null,
-  scan: { rs485: null, can: null }, scanned: { rs485: new Set(), canopen: new Set() },
+  scan: { rs485: null, can: null, qwiic: null, i2c: null, spi: null },
+  scanned: { rs485: new Set(), canopen: new Set(), qwiic: new Set(), i2c: new Set() },
   trace: [], traceMax: 5000, tracePaused: false, traceFollow: true, traceDrop: 0,
   traceFilter: { bus: 'all', text: '' },
   ids: [], idsPrev: new Map(), idsSort: store('idsSort') || { key: 'id', asc: true }, idsFilter: '',
-  gridCan: store('gridCan') || 'canopen',
-  watchHist: new Map(), lastRx: new Map(), pulse: new Set(),
+  gridCan: store('gridCan') || 'canopen', gridI2c: store('gridI2c') || 'qwiic',
+  watchHist: new Map(), lastRx: new Map(), pulse: new Set(), chartSel: null,
 };
+// Bus ids in trace frames (firmware enum order)
+const BUS_IDS = ['rs485', 'can', 'qwiic', 'i2c', 'spi'];
+const BUSES = BUS_IDS;
+const XBUSES = ['qwiic', 'i2c', 'spi'];
+const isI2cBus = b => b === 'qwiic' || b === 'i2c';
+const hexAddr = a => '0x' + hex2(a);
 const serverNow = () => S.serverNow + (performance.now() - S.serverNowAt);
 const busCfg = bus => (S.status && S.status[bus]) || (S.hello && S.hello.settings[bus]) || {};
 const canActive = () => busCfg('can').mode === 'normal';
@@ -429,6 +457,8 @@ function onStatus(s) {
 // toggles, map cards, Settings, device panel). New views must hook in here.
 function refreshBusViews(prevMode) {
   renderHeader(); renderStatusbar(); renderBusHeads(); syncForms();
+  const dc = $('#setDevCount');
+  if (dc) dc.textContent = `${S.devices.size} device${S.devices.size === 1 ? '' : 's'}`;
   if (S.view === 'grid') renderGrid();
   if (S.view === 'map') scheduleRender();
   if (S.selected) {
@@ -454,6 +484,7 @@ function onDevices(list, now) {
     const prev = S.devices.get(d.key);
     if (prev && d.rx > prev.rx) S.pulse.add(d.key);
     if (d.watch) recordWatchHistory(d);
+    recordValueHistory(d);
     S.devices.set(d.key, Object.assign(prev || {}, d));
   }
   scheduleRender();
@@ -468,9 +499,20 @@ function recordWatchHistory(d) {
     const v = decodeValue(w.fmt, hexBytes(w.raw), d.proto, w.fn);
     if (typeof v !== 'number') return;
     hist.push({ ts: w.ts, v: v * (w.scale || 1) });
-    if (hist.length > 120) hist.shift();
+    if (hist.length > 300) hist.shift();
     S.watchHist.set(k, hist);
   });
+}
+function recordValueHistory(d) {
+  if (!d.values || !d.vts) return;
+  for (const v of d.values) {
+    const k = `${d.key}|v|${v.n}`;
+    const hist = S.watchHist.get(k) || [];
+    if (hist.length && hist[hist.length - 1].ts === d.vts) continue;
+    hist.push({ ts: d.vts, v: v.v });
+    if (hist.length > 300) hist.shift();
+    S.watchHist.set(k, hist);
+  }
 }
 
 // =====================================================================
@@ -486,17 +528,31 @@ function devStatus(d) {
   return age > stale ? 'stale' : 'ok';
 }
 const STATUS_TEXT = { ok: 'online', stale: 'quiet', err: 'not responding', offline: 'not seen yet' };
-function devTag(d) { return d.proto === 'modbus' ? 'MB ' + d.addr : d.proto === 'canopen' ? 'CO ' + d.addr : 'J ' + d.addr; }
+function devTag(d) {
+  switch (d.proto) {
+    case 'modbus': return 'MB ' + d.addr;
+    case 'canopen': return 'CO ' + d.addr;
+    case 'j1939': return 'J ' + d.addr;
+    case 'i2c': return hexAddr(d.addr);
+    case 'spi': return 'CS' + d.addr;
+  }
+  return String(d.addr);
+}
 function devName(d) {
   if (d.label) return d.label;
+  if (isRawProto(d.proto) && d.product) return d.product.replace(/ \(unconfirmed\)$/, '');
   const ident = [d.vendor, d.product].filter(Boolean).join(' ') || d.name;
   if (ident) return ident;
   if (d.proto === 'j1939' && d.j1939Name) { const n = decodeJ1939Name(d.j1939Name); if (n && n._fn < J1939_FUNCTIONS.length) return J1939_FUNCTIONS[n._fn]; }
-  return d.proto === 'modbus' ? 'Modbus device' : d.proto === 'canopen' ? 'CANopen node' : 'J1939 ECU';
+  return { modbus: 'Modbus device', canopen: 'CANopen node', j1939: 'J1939 ECU', i2c: 'I²C device', spi: 'SPI device' }[d.proto] || 'Device';
+}
+function valuesSummary(d, max = 2) {
+  return (d.values || []).slice(0, max).map(v => `${v.v.toFixed(Math.abs(v.v) >= 100 ? 1 : 2)} ${v.u}`).join(' · ');
 }
 function devSub(d) {
   const st = devStatus(d);
   if (d.proto === 'canopen' && d.state != null && st !== 'err') return NMT_STATE[d.state] || 'state ' + d.state;
+  if (d.values && d.values.length && st === 'ok') return valuesSummary(d);
   if (st === 'ok') return d.passive ? 'online · passive' : 'online · ' + fmtAge(serverNow() - d.lastSeen);
   if (st === 'stale') return 'last seen ' + fmtAge(serverNow() - d.lastSeen);
   return STATUS_TEXT[st];
@@ -526,6 +582,10 @@ function renderHeader() {
     if (c.busy) cs += ' · ' + c.busy;
   }
   $('#pill-can-sub').textContent = cs;
+  const q = busCfg('qwiic');
+  $('#pill-qwiic input').checked = !!q.enabled;
+  const nq = devsOn('qwiic').filter(d => d.present && d.consecErr < 3).length;
+  $('#pill-qwiic-sub').textContent = q.enabled ? `${kbit(q.hz || 100000)}Hz · ${nq} device${nq === 1 ? '' : 's'}` : 'off';
 }
 function renderStatusbar() {
   const s = S.status; if (!s) return;
@@ -538,6 +598,7 @@ function renderStatusbar() {
     s.rs485.err ? item('RS485 errors', s.rs485.err, 'err') : null,
     item('CAN', `${Math.round(S.rates.can)}/s rx · ${Math.round(S.rates.cantx)}/s tx`),
     s.can.up ? item('CAN state', `${s.can.state} (TEC ${s.can.tec} / REC ${s.can.rec})`, s.can.state === 'running' ? '' : 'err') : null,
+    item('Expansion', XBUSES.filter(b => s[b] && s[b].enabled).map(b => BUS_INFO[b].short).join(' · ') || 'off'),
     item('Devices', s.devices),
     h('span', { class: 'hide-sm' }, 'Wi-Fi ', h('b', null, w.sta && w.sta.connected ? `${w.sta.ip} (${w.sta.rssi} dBm)` : `AP ${w.ap ? w.ap.clients : 0} client(s)`)),
     h('span', { class: 'hide-sm' }, 'Heap ', h('b', null, fmtBytes(s.heap))),
@@ -586,25 +647,36 @@ function scheduleRender() {
 // Map view (topology)
 // =====================================================================
 const BUS_INFO = {
-  rs485: { title: 'RS485', protos: 'Modbus RTU' },
-  can: { title: 'CAN', protos: 'CANopen · J1939 · raw' },
+  rs485: { title: 'RS485', protos: 'Modbus RTU', short: 'RS485' },
+  can: { title: 'CAN', protos: 'CANopen · J1939 · raw', short: 'CAN' },
+  qwiic: { title: 'Qwiic I²C', protos: 'SH1.0 connector · SDA IO2 · SCL IO1', short: 'Qwiic' },
+  i2c: { title: 'Header I²C', protos: 'pin header · SDA IO8 · SCL IO9', short: 'I²C' },
+  spi: { title: 'SPI', protos: 'pin header · SCK IO12 · MOSI IO11 · MISO IO13', short: 'SPI' },
+};
+const WIRING_HINT = {
+  qwiic: 'Enable to scan the Qwiic connector. Devices are detected automatically when plugged in.',
+  i2c: 'Disabled. Connect SDA to IO8 and SCL to IO9 on the internal pin header (with 3V3 and GND), then enable.',
+  spi: 'Disabled. Connect SCK to IO12, MOSI to IO11, MISO to IO13 and CS to IO10 on the internal pin header, then enable.',
 };
 
 function buildMapSkeleton() {
   const v = $('#view-map');
   if (v.dataset.built) return;
   v.dataset.built = '1';
-  for (const bus of ['rs485', 'can']) {
-    v.append(h('div', { class: 'card bus-card', 'data-bus': bus, id: 'buscard-' + bus },
+  for (const bus of BUSES) {
+    const xb = XBUSES.includes(bus);
+    v.append(h('div', { class: 'card bus-card' + (xb ? ' xbus' : ''), 'data-bus': bus, id: 'buscard-' + bus },
       h('div', { class: 'card-head' },
         h('label', { class: 'switch', title: `Enable / disable ${BUS_INFO[bus].title}` },
           h('input', { type: 'checkbox', 'data-act': 'toggle-bus', 'data-bus': bus }), h('span')),
         h('h2', null, BUS_INFO[bus].title, h('span', { class: 'muted', style: { fontWeight: 400 } }, ' · ' + BUS_INFO[bus].protos)),
         h('span', { class: 'meta', id: 'busmeta-' + bus }),
         h('span', { class: 'spacer' }),
+        xb ? h('button', { class: 'btn small', onclick: () => wiringDialog(bus) }, 'Wiring') : null,
         h('button', { class: 'btn small', onclick: () => busConfigDialog(bus) }, 'Configure'),
         h('button', { class: 'btn small primary', onclick: () => scanDialog(bus) }, 'Scan…')),
       h('div', { class: 'scanbar', id: 'scanbar-' + bus, hidden: true }),
+      xb ? h('div', { class: 'xbus-hint', id: 'hint-' + bus, hidden: true }, WIRING_HINT[bus]) : null,
       h('div', { class: 'topo-wrap' }, sv('svg', { class: 'topo', id: 'topo-' + bus, role: 'img', 'aria-label': `${bus} topology` }))));
   }
   // Re-layout whenever the available width changes (window resize, drawer, tab shown).
@@ -623,22 +695,32 @@ function buildMapSkeleton() {
     h('span', { class: 'faint' }, 'Select a device to configure. Termination: 120 Ω jumpers H1 (CAN), H2 (RS485).')));
 }
 
+function busLink(bus, c) {
+  switch (bus) {
+    case 'rs485': return `${c.baud} 8${c.parity}${c.stop}`;
+    case 'can': return `${kbit(c.bitrate || 0)}bit/s · ${c.mode === 'normal' ? 'active' : 'listen-only'}`;
+    case 'spi': return `${kbit(c.hz || 0)}Hz · mode ${c.mode} · CS ${(c.cs || []).map(x => 'IO' + x).join(', ')}`;
+    default: return `${kbit(c.hz || 0)}Hz${c.autoScan ? ' · auto-detect' : ''}`;
+  }
+}
+
 function renderBusHeads() {
-  for (const bus of ['rs485', 'can']) {
+  for (const bus of BUSES) {
     const meta = $('#busmeta-' + bus); if (!meta) continue;
     const c = busCfg(bus), n = devsOn(bus).length;
     $(`#buscard-${bus} .card-head input`).checked = !!c.enabled;
     $('#buscard-' + bus).classList.toggle('off', !c.enabled);
-    const link = bus === 'rs485' ? `${c.baud} 8${c.parity}${c.stop}` : `${kbit(c.bitrate || 0)}bit/s · ${c.mode === 'normal' ? 'active' : 'listen-only'}`;
-    const rate = Math.round(bus === 'rs485' ? S.rates.rs485 : S.rates.can);
-    meta.textContent = c.enabled ? `${link} · ${n} device${n === 1 ? '' : 's'} · ${rate} frames/s` : 'disabled';
+    const hint = $('#hint-' + bus);
+    if (hint) hint.hidden = !!c.enabled;
+    const tail = bus === 'rs485' || bus === 'can' ? ` · ${Math.round(bus === 'rs485' ? S.rates.rs485 : S.rates.can)} frames/s` : '';
+    meta.textContent = c.enabled ? `${busLink(bus, c)} · ${n} device${n === 1 ? '' : 's'}${tail}` : 'disabled';
   }
 }
 
 function renderMap() {
   buildMapSkeleton();
   renderBusHeads();
-  for (const bus of ['rs485', 'can']) renderTopology(bus);
+  for (const bus of BUSES) renderTopology(bus);
   S.pulse.clear();
 }
 
@@ -647,11 +729,14 @@ function truncate(s, n) { s = String(s); return s.length > n ? s.slice(0, n - 1)
 function renderTopology(bus) {
   const svg = $('#topo-' + bus);
   const wrap = svg.parentElement;
+  const c = busCfg(bus);
+  const devs = devsOn(bus);
+  // Disabled expansion buses show only the wiring hint.
+  wrap.hidden = XBUSES.includes(bus) && !c.enabled && !devs.length;
+  if (wrap.hidden) return;
   if (!wrap.clientWidth) return;  // not laid out yet; ResizeObserver will call us again
   const W = Math.max(640, wrap.clientWidth - 16);
   svg.style.width = W + 'px';
-  const c = busCfg(bus);
-  const devs = devsOn(bus);
   const items = devs.map(d => ({ d }));
   if (bus === 'can' && S.ids.length) items.push({ ids: S.ids.length });
   items.push({ ghost: true });
@@ -680,17 +765,22 @@ function renderTopology(bus) {
   const term = (x, y, label) => [
     sv('rect', { class: 'term', x: x - 7, y: y - 13, width: 14, height: 26, rx: 2 }),
     sv('text', { class: 'term-label', x, y: y - 19, 'text-anchor': 'middle' }, label)];
-  kids.push(...term(endX, endY, '120 Ω'));
+  if (bus === 'rs485' || bus === 'can') kids.push(...term(endX, endY, '120 Ω'));
   // gateway
   const gy = trunkY(0) - gwH / 2;
-  const sub1 = bus === 'rs485' ? (c.enabled ? `${c.baud} 8${c.parity}${c.stop}` : 'disabled') : (c.enabled ? `${kbit(c.bitrate || 0)}bit/s` : 'disabled');
-  const sub2 = bus === 'rs485' ? 'Modbus master / sniffer' : (c.enabled ? (c.mode === 'normal' ? 'active (ACK + TX)' : 'listen-only') : '');
+  const GW = {
+    rs485: [c.enabled ? `${c.baud} 8${c.parity}${c.stop}` : 'disabled', 'Modbus master / sniffer', 'jumper H2: 120 Ω'],
+    can: [c.enabled ? `${kbit(c.bitrate || 0)}bit/s` : 'disabled', c.enabled ? (c.mode === 'normal' ? 'active (ACK + TX)' : 'listen-only') : '', 'jumper H1: 120 Ω'],
+    qwiic: [c.enabled ? `${kbit(c.hz || 0)}Hz controller` : 'disabled', 'SDA IO2 · SCL IO1', '3.3 V, internal pull-ups'],
+    i2c: [c.enabled ? `${kbit(c.hz || 0)}Hz controller` : 'disabled', 'SDA IO8 · SCL IO9', '3.3 V, internal pull-ups'],
+    spi: [c.enabled ? `${kbit(c.hz || 0)}Hz · mode ${c.mode}` : 'disabled', 'SCK 12 · MOSI 11 · MISO 13', 'CS ' + (c.cs || []).map(x => 'IO' + x).join(' ')],
+  }[bus];
   kids.push(sv('g', { class: 'gw', transform: `translate(20 ${gy})` },
     sv('rect', { width: gwW, height: gwH, rx: 10 }),
     sv('text', { x: 12, y: 22 }, 'WonderScope'),
-    sv('text', { x: 12, y: 40, class: 'sub' }, sub1),
-    sv('text', { x: 12, y: 56, class: 'sub' }, sub2),
-    sv('text', { x: 12, y: 70, class: 'sub', style: 'font-size:9.5px' }, `jumper ${bus === 'rs485' ? 'H2' : 'H1'}: 120 Ω`)));
+    sv('text', { x: 12, y: 40, class: 'sub' }, GW[0]),
+    sv('text', { x: 12, y: 56, class: 'sub' }, GW[1]),
+    sv('text', { x: 12, y: 70, class: 'sub', style: 'font-size:9.5px' }, GW[2])));
 
   items.forEach((it, i) => {
     const r = Math.floor(i / perRow), k = i % perRow, col = Math.floor(k / 2), above = k % 2 === 0;
@@ -704,7 +794,8 @@ function renderTopology(bus) {
       kids.push(sv('g', { class: 'ghost', transform: `translate(${x} ${y})`, tabindex: 0, role: 'button', onclick: () => scanDialog(bus) },
         sv('rect', { width: cardW, height: cardH, rx: 8 }),
         sv('text', { x: cardW / 2, y: cardH / 2 - 2, 'text-anchor': 'middle' }, devs.length ? '+ Scan' : 'No devices'),
-        sv('text', { x: cardW / 2, y: cardH / 2 + 14, 'text-anchor': 'middle', style: 'font-size:11px' }, devs.length ? '' : 'Scan or await traffic')));
+        sv('text', { x: cardW / 2, y: cardH / 2 + 14, 'text-anchor': 'middle', style: 'font-size:11px' },
+          devs.length ? '' : bus === 'qwiic' ? 'Plug in a Qwiic device' : bus === 'spi' ? 'Scan the CS lines' : isI2cBus(bus) ? 'Scan the bus' : 'Scan or await traffic')));
       return;
     }
     if (it.ids) {
@@ -755,6 +846,14 @@ function renderGrid() {
           h('span', { class: 'spacer' }), h('span', { class: 'muted', id: 'gridscan-can' }),
           h('button', { class: 'btn small primary', onclick: () => scanDialog('can') }, 'Scan…')),
         h('div', { class: 'card-body' }, h('div', { class: 'addr-grid', id: 'grid-can' }))),
+      h('div', { class: 'card', 'data-bus': 'i2c' },
+        h('div', { class: 'card-head' }, h('span', { class: 'badge i2c' }, 'I²C'),
+          h('div', { class: 'seg', id: 'gridSegI2c' },
+            h('button', { 'data-p': 'qwiic' }, 'Qwiic 0x08–0x77'),
+            h('button', { 'data-p': 'i2c' }, 'Header 0x08–0x77')),
+          h('span', { class: 'spacer' }), h('span', { class: 'muted', id: 'gridscan-i2cx' }),
+          h('button', { class: 'btn small primary', onclick: () => scanDialog(S.gridI2c) }, 'Scan…')),
+        h('div', { class: 'card-body' }, h('div', { class: 'addr-grid', id: 'grid-i2cx' }))),
       h('div', { class: 'legend' },
         h('span', null, h('i', { style: { background: 'var(--ok-soft)', border: '1px solid var(--ok)' } }), 'device online'),
         h('span', null, h('i', { style: { background: 'var(--warn-soft)', border: '1px solid var(--warn)' } }), 'quiet'),
@@ -765,32 +864,38 @@ function renderGrid() {
       const b = e.target.closest('button'); if (!b) return;
       S.gridCan = b.dataset.p; store('gridCan', S.gridCan); renderGrid();
     });
+    $('#gridSegI2c').addEventListener('click', e => {
+      const b = e.target.closest('button'); if (!b) return;
+      S.gridI2c = b.dataset.p; store('gridI2c', S.gridI2c); renderGrid();
+    });
   }
   $$('#gridSeg button').forEach(b => b.classList.toggle('on', b.dataset.p === S.gridCan));
+  $$('#gridSegI2c button').forEach(b => b.classList.toggle('on', b.dataset.p === S.gridI2c));
   fillGrid('grid-rs485', 'rs485', 'modbus', 1, 247);
   if (S.gridCan === 'canopen') fillGrid('grid-can', 'can', 'canopen', 1, 127);
   else fillGrid('grid-can', 'can', 'j1939', 0, 253);
-  for (const bus of ['rs485', 'can']) {
-    const sc = S.scan[bus];
-    $('#gridscan-' + bus).textContent = sc && sc.state === 'running' ? `Scanning ${sc.proto} ${sc.cur}… found ${sc.found}` : '';
-  }
+  fillGrid('grid-i2cx', S.gridI2c, 'i2c', 0x08, 0x77);
+  const scanText = sc => sc && sc.state === 'running' ? `Scanning ${sc.proto} ${sc.proto === 'i2c' ? hexAddr(sc.cur) : sc.cur}… found ${sc.found}` : '';
+  $('#gridscan-rs485').textContent = scanText(S.scan.rs485);
+  $('#gridscan-can').textContent = scanText(S.scan.can);
+  $('#gridscan-i2cx').textContent = scanText(S.scan[S.gridI2c]) || (busCfg(S.gridI2c).enabled ? '' : 'bus disabled');
 }
 function fillGrid(id, bus, proto, from, to) {
   const g = $('#' + id);
-  if (g.dataset.proto !== proto) {
-    g.dataset.proto = proto;
+  const label = a => proto === 'i2c' ? hex2(a) : String(a);
+  const tip = a => proto === 'j1939' ? `SA ${a} (0x${hex2(a)})` : proto === 'i2c' ? `address ${hexAddr(a)}` : `address ${a}`;
+  if (g.dataset.key !== bus + proto) {
+    g.dataset.key = bus + proto;
     g.replaceChildren();
-    for (let a = from; a <= to; a++) {
-      g.append(h('button', { class: 'cell', 'data-addr': a, title: proto === 'j1939' ? `SA ${a} (0x${hex2(a)})` : `address ${a}` }, String(a)));
-    }
+    for (let a = from; a <= to; a++) g.append(h('button', { class: 'cell', 'data-addr': a, title: tip(a) }, label(a)));
     g.onclick = e => {
       const c = e.target.closest('.cell'); if (!c) return;
       gridClick(bus, proto, +c.dataset.addr);
     };
   }
   const sc = S.scan[bus];
-  const scanning = sc && sc.state === 'running' && (sc.proto === proto || (proto === 'modbus' && bus === 'rs485')) ? sc.cur : -1;
-  const scanned = S.scanned[proto === 'modbus' ? 'rs485' : proto] || new Set();
+  const scanning = sc && sc.state === 'running' && (sc.proto === proto || bus === 'rs485') ? sc.cur : -1;
+  const scanned = S.scanned[bus === 'rs485' ? 'rs485' : bus === 'can' ? proto : bus] || new Set();
   for (const c of g.children) {
     const a = +c.dataset.addr, key = `${bus}:${proto}:${a}`, d = S.devices.get(key);
     let cls = 'cell';
@@ -799,18 +904,28 @@ function fillGrid(id, bus, proto, from, to) {
     if (scanned.has(a)) cls += ' scanned';
     if (S.selected === key) cls += ' selected';
     if (c.className !== cls) c.className = cls;
-    const lbl = d ? (d.label || '') : '';
-    const want = lbl ? [String(a), lbl] : [String(a)];
+    const lbl = d ? (d.label || (proto === 'i2c' ? devName(d) : '')) : '';
     if (c.dataset.lbl !== lbl) {
       c.dataset.lbl = lbl;
-      c.replaceChildren(want[0], lbl ? h('span', { class: 'lbl' }, lbl) : '');
-      c.title = d ? `${devName(d)} — ${STATUS_TEXT[devStatus(d)]}` : (proto === 'j1939' ? `SA ${a} (0x${hex2(a)})` : `address ${a}`);
+      c.replaceChildren(label(a), lbl ? h('span', { class: 'lbl' }, lbl) : '');
+      c.title = d ? `${devName(d)} — ${STATUS_TEXT[devStatus(d)]}` : tip(a);
     }
   }
 }
 async function gridClick(bus, proto, addr) {
   const key = `${bus}:${proto}:${addr}`;
   if (S.devices.has(key)) return openDevice(key);
+  if (proto === 'i2c') {
+    if (!busCfg(bus).enabled) return toast(`${BUS_INFO[bus].title} is disabled`, 'err');
+    try {
+      const res = await call('i2c.ident', { bus, addr });
+      if (!res.present) return toast(`${BUS_INFO[bus].title} ${hexAddr(addr)}: no ACK`, 'err');
+      toast(`${hexAddr(addr)}: ${res.product || 'device present'}`, 'ok');
+      await loadDevices();
+      openDevice(key);
+    } catch (e) { fail(e); }
+    return;
+  }
   const what = proto === 'modbus' ? `Modbus address ${addr}` : proto === 'canopen' ? `CANopen node ${addr}` : `J1939 address ${addr}`;
   const needActive = bus === 'can' && !canActive();
   const r = await modal(what, h('div', { class: 'stack' },
@@ -845,7 +960,7 @@ async function gridClick(bus, proto, addr) {
 function onScan(m) {
   const bus = m.bus;
   S.scan[bus] = m;
-  const setKey = bus === 'rs485' ? 'rs485' : m.proto;
+  const setKey = bus === 'can' ? m.proto : bus;
   if (m.state === 'running') {
     if (!S.scanned[setKey] || m.cur === m.from) S.scanned[setKey] = new Set();
     for (let a = m.from; a < m.cur; a++) S.scanned[setKey].add(a);
@@ -856,11 +971,15 @@ function onScan(m) {
   if (bar) {
     if (m.state === 'running') {
       const span = Math.max(1, m.to - m.from + 1);
-      const pct = m.proto === 'j1939' ? 50 : clamp(((m.cur - m.from) / span) * 100, 0, 100);
+      const pct = m.proto === 'j1939' || m.proto === 'spi' ? 50 : clamp(((m.cur - m.from) / span) * 100, 0, 100);
       const pass = m.passes > 1 ? ` · pass ${m.pass}/${m.passes} @ ${m.baud} 8${m.parity}1` : '';
+      const text = m.proto === 'j1939' ? 'Requesting J1939 address claims…'
+        : m.proto === 'spi' ? `Probing CS IO${m.cur}…`
+        : m.proto === 'i2c' ? `Scanning address ${hexAddr(m.cur)} of ${hexAddr(m.from)}–${hexAddr(m.to)}`
+        : `Scanning ${m.proto === 'modbus' ? 'address' : 'node'} ${m.cur} of ${m.from}–${m.to}${pass}`;
       bar.hidden = false;
       bar.replaceChildren(
-        h('span', null, m.proto === 'j1939' ? 'Requesting J1939 address claims…' : `Scanning ${m.proto === 'modbus' ? 'address' : 'node'} ${m.cur} of ${m.from}–${m.to}${pass}`),
+        h('span', null, text),
         h('div', { class: 'progress' }, h('div', { style: { width: pct + '%' } })),
         h('b', null, `${m.found} found`),
         h('button', { class: 'btn small', onclick: () => call('scan.cancel', { bus }).catch(fail) }, 'Stop'));
@@ -878,7 +997,53 @@ async function scanDialog(bus) {
     await toggleBus(bus, true);
   }
   if (bus === 'rs485') return scanDialogRs485();
-  return scanDialogCan();
+  if (bus === 'can') return scanDialogCan();
+  if (bus === 'spi') {
+    const cs = (busCfg('spi').cs || []).map(x => 'IO' + x).join(', ');
+    if (!await confirmBox('Probe SPI chip selects?', `Sends a JEDEC ID read (0x9F) and sensor ID register reads on CS ${cs}.`, 'Probe')) return;
+    return runScan('spi', { bus: 'spi' });
+  }
+  return runScan(bus, { bus });  // I2C: probe 0x08-0x77 and identify
+}
+
+function wiringDialog(bus) {
+  modal(`${BUS_INFO[bus].title} wiring`, h('div', { class: 'stack' }, pinDiagram(bus),
+    h('p', { class: 'hint' }, '3.3 V logic, not 5 V tolerant, not isolated. The 5V header pin is a supply output.' +
+      (isI2cBus(bus) ? ' Internal pull-ups are weak; fit 2.2–4.7 kΩ to 3V3 for long or fast buses. Most Qwiic boards include them.' : ''))),
+  [{ label: 'Close', value: 'ok', cls: 'primary' }]);
+}
+
+// Pin diagram of the Qwiic connector and the 2x10 header, highlighting a bus.
+function pinDiagram(focus) {
+  const L = [['3V3', 'pwr'], ['GND', 'gnd'], ['IO43', 'uart', 'UART0 TX'], ['IO44', 'uart', 'UART0 RX'], ['IO3', 'cs', 'SPI CS*'],
+    ['IO4', 'cs', 'SPI CS*'], ['IO5', 'cs', 'SPI CS*'], ['IO6', 'cs', 'SPI CS*'], ['IO7', 'cs', 'SPI CS*'], ['IO8', 'i2c', 'I²C SDA']];
+  const R = [['5V', 'pwr'], ['GND', 'gnd'], ['IO20', 'usb', 'USB D+ (avoid)'], ['IO19', 'usb', 'USB D− (avoid)'], ['IO14', 'cs', 'SPI CS*'],
+    ['IO13', 'spi', 'SPI MISO'], ['IO12', 'spi', 'SPI SCK'], ['IO11', 'spi', 'SPI MOSI'], ['IO10', 'spi', 'SPI CS'], ['IO9', 'i2c', 'I²C SCL']];
+  const hot = k => (focus === 'i2c' && k === 'i2c') || (focus === 'spi' && (k === 'spi' || k === 'cs')) || k === 'pwr' || k === 'gnd' || !focus;
+  const W = 520, rowH = 22, top = 132, cx = W / 2;
+  const kids = [];
+  // Qwiic connector
+  const q = [['GND', 'gnd'], ['3V3', 'pwr'], ['SDA IO2', 'i2c'], ['SCL IO1', 'i2c']];
+  kids.push(sv('text', { x: 16, y: 20, class: 'pd-title' }, 'Qwiic connector (SH1.0, beside USB-C)'));
+  q.forEach(([t, k], i) => {
+    const x = 24 + i * 118, on = focus !== 'spi' && focus !== 'i2c' || k === 'pwr' || k === 'gnd';
+    kids.push(sv('rect', { x, y: 32, width: 104, height: 26, rx: 5, class: `pd-pin pd-${k} ${on ? '' : 'pd-dim'}` }),
+      sv('text', { x: x + 52, y: 49, 'text-anchor': 'middle', class: 'pd-lbl' }, t));
+  });
+  kids.push(sv('text', { x: 16, y: 86, class: 'pd-title' }, 'Pin header, 2×10, 2.0 mm (inside case, power terminal end at top)'));
+  kids.push(sv('rect', { x: cx - 38, y: top - 16, width: 76, height: rowH * 10 + 12, rx: 6, class: 'pd-body' }));
+  for (let i = 0; i < 10; i++) {
+    const y = top + i * rowH;
+    for (const [side, row] of [[-1, L[i]], [1, R[i]]]) {
+      const [name, kind, fn] = row, on = hot(kind);
+      const px = cx + side * 16;
+      kids.push(sv('circle', { cx: px, cy: y, r: 7, class: `pd-dot pd-${kind} ${on ? '' : 'pd-dim'}` }));
+      kids.push(sv('text', { x: cx + side * 50, y: y + 4, 'text-anchor': side < 0 ? 'end' : 'start', class: `pd-name ${on ? '' : 'pd-dim'}` }, name));
+      if (fn) kids.push(sv('text', { x: cx + side * 110, y: y + 4, 'text-anchor': side < 0 ? 'end' : 'start', class: `pd-fn pd-t-${kind} ${on ? '' : 'pd-dim'}` }, fn));
+    }
+  }
+  kids.push(sv('text', { x: 16, y: top + rowH * 10 + 22, class: 'pd-note' }, '* optional additional SPI chip selects'));
+  return sv('svg', { class: 'pin-diagram', viewBox: `0 0 ${W} ${top + rowH * 10 + 32}`, role: 'img', 'aria-label': 'Expansion pin diagram' }, kids);
 }
 
 async function scanDialogRs485() {
@@ -994,6 +1159,33 @@ function applyBusStatus(bus, r) {
 
 async function busConfigDialog(bus) {
   const c = busCfg(bus);
+  if (isI2cBus(bus)) {
+    const hz = h('select', null, [[100000, '100 kHz (standard)'], [400000, '400 kHz (fast)'], [1000000, '1 MHz (fast plus)']]
+      .map(([v, t]) => h('option', { value: v, selected: v === c.hz }, t)));
+    const auto = h('input', { type: 'checkbox', checked: c.autoScan });
+    const r = await modal(BUS_INFO[bus].title, [h('div', { class: 'form-grid' }, h('label', { class: 'field' }, h('span', null, 'Clock'), hz)),
+      h('label', { class: 'check' }, auto, 'Detect added and removed devices (probe every 5 s)')],
+    [{ label: 'Cancel', value: 'cancel' }, { label: 'Apply', value: 'ok', cls: 'primary' }]);
+    if (r !== 'ok') return;
+    try { applyBusStatus(bus, await call(bus + '.config', { hz: +hz.value, autoScan: auto.checked })); toast(`${BUS_INFO[bus].title} settings applied`, 'ok'); } catch (e) { fail(e); }
+    return;
+  }
+  if (bus === 'spi') {
+    const hz = h('select', null, [100000, 500000, 1000000, 2000000, 4000000, 8000000, 10000000, 20000000, 40000000]
+      .map(v => h('option', { value: v, selected: v === c.hz }, kbit(v) + 'Hz')));
+    if (![...hz.options].some(o => +o.value === c.hz)) hz.append(h('option', { value: c.hz, selected: true }, kbit(c.hz) + 'Hz'));
+    const mode = h('select', null, [0, 1, 2, 3].map(m => h('option', { value: m, selected: m === c.mode }, `Mode ${m} (CPOL ${m >> 1}, CPHA ${m & 1})`)));
+    const csBoxes = [10, 3, 4, 5, 6, 7, 8, 14].map(g => h('label', { class: 'check' }, h('input', { type: 'checkbox', value: g, checked: (c.cs || []).includes(g) }), 'IO' + g));
+    const rb = h('input', { type: 'checkbox', checked: c.readBit });
+    const r = await modal('SPI', [h('div', { class: 'form-grid' }, h('label', { class: 'field' }, h('span', null, 'Clock'), hz), h('label', { class: 'field' }, h('span', null, 'Mode'), mode)),
+      h('div', null, h('div', { class: 'muted', style: { fontSize: '12.5px', marginBottom: '6px' } }, 'Chip selects (up to 4)'), h('div', { class: 'row' }, csBoxes)),
+      h('label', { class: 'check' }, rb, 'Register reads set bit 7 of the address byte')],
+    [{ label: 'Cancel', value: 'cancel' }, { label: 'Apply', value: 'ok', cls: 'primary' }]);
+    if (r !== 'ok') return;
+    const cs = csBoxes.filter(l => l.firstChild.checked).map(l => +l.firstChild.value);
+    try { applyBusStatus('spi', await call('spi.config', { hz: +hz.value, mode: +mode.value, cs, readBit: rb.checked })); toast('SPI settings applied', 'ok'); } catch (e) { fail(e); }
+    return;
+  }
   if (bus === 'rs485') {
     const baud = h('select', null, [1200, 2400, 4800, 9600, 14400, 19200, 38400, 57600, 115200, 230400].map(b => h('option', { value: b, selected: b === c.baud }, b)));
     if (![...baud.options].some(o => +o.value === c.baud)) baud.append(h('option', { value: c.baud, selected: true }, c.baud));
@@ -1051,6 +1243,7 @@ async function refreshSelected() {
     if (S.selected !== key) return;
     S.devices.set(key, Object.assign(S.devices.get(key) || {}, full));
     if (full.watch) recordWatchHistory(full);
+    recordValueHistory(full);
     updateDrawerLive();
   } catch (e) { /* device may have been removed */ }
 }
@@ -1061,6 +1254,9 @@ function renderDrawer() {
   if (d.proto === 'modbus') tabs.push(['regs', 'Registers'], ['watch', 'Watch']);
   if (d.proto === 'canopen') tabs.push(['objects', 'Objects & NMT'], ['watch', 'Watch']);
   if (d.proto === 'j1939') tabs.push(['pgns', 'PGNs']);
+  if (d.proto === 'i2c') tabs.push(['values', 'Values'], ['i2cregs', 'Registers'], ['watch', 'Watch']);
+  if (d.proto === 'spi') tabs.push(['spixfer', 'Transfer'], ['watch', 'Watch']);
+  if (S.drawerTab === 'overview' && d.proto === 'i2c' && d.driver && S.drawerAuto !== d.key) { S.drawerTab = 'values'; S.drawerAuto = d.key; }
   if (!tabs.some(t => t[0] === S.drawerTab)) S.drawerTab = 'overview';
   const label = h('input', { value: d.label || '', placeholder: devName(d), 'aria-label': 'Device label', title: 'Rename' });
   const saveLabel = async () => {
@@ -1083,7 +1279,10 @@ function renderDrawer() {
       }, t)))),
     body);
   const tab = S.drawerTab;
-  const content = { overview: drawerOverview, regs: drawerRegisters, objects: drawerObjects, watch: drawerWatch, pgns: drawerPgns }[tab];
+  const content = {
+    overview: drawerOverview, regs: drawerRegisters, objects: drawerObjects, watch: drawerWatch, pgns: drawerPgns,
+    values: drawerValues, i2cregs: drawerI2cRegs, spixfer: drawerSpi,
+  }[tab];
   append(body, [content(d)]);
   updateDrawerLive();
 }
@@ -1103,6 +1302,10 @@ function updateDrawerLive() {
   if (pg) renderPgnTable(d, pg);
   const nmt = $('#dNmtState');
   if (nmt) nmt.textContent = d.state != null ? (NMT_STATE[d.state] || d.state) : 'unknown (no heartbeat seen)';
+  const vt = $('#dValues');
+  if (vt) renderValues(d, vt);
+  const ch = $('#dChart');
+  if (ch) renderChart(ch);
 }
 
 function overviewFacts(d) {
@@ -1112,7 +1315,10 @@ function overviewFacts(d) {
   add('Last seen', d.lastSeen ? fmtAge(serverNow() - d.lastSeen) : 'never');
   add('Frames / errors', `${d.rx} / ${d.errs}${d.consecErr ? ` (${d.consecErr} in a row)` : ''}`);
   if (d.proto === 'canopen') add('NMT state', d.state != null ? NMT_STATE[d.state] || d.state : 'unknown');
+  if (d.proto === 'i2c') add('Bus / address', `${BUS_INFO[d.bus].title} · ${hexAddr(d.addr)}`);
+  if (d.proto === 'spi') add('Chip select', 'IO' + d.addr);
   add('Vendor', d.vendor); add('Product', d.product); add('Revision', d.revision); add('Name', d.name); add('Serial', d.serial);
+  if (d.proto === 'i2c') add('Driver', d.driver ? `${d.driver}${d.valsErr ? ' (read error)' : ''}` : 'none');
   if (d.co) {
     const prof = d.co.deviceType & 0xffff;
     add('Device type', `0x${hex8(d.co.deviceType)}${CO_PROFILES[prof] ? ' — ' + CO_PROFILES[prof] : prof ? ' — profile ' + prof : ''}`);
@@ -1148,6 +1354,8 @@ function drawerOverview(d) {
     try {
       if (d.proto === 'modbus') await call('mb.ident', { addr: d.addr });
       else if (d.proto === 'canopen') { if (!canActive()) await setCanMode('normal'); await call('co.info', { node: d.addr }); }
+      else if (d.proto === 'i2c') await call('i2c.ident', { bus: d.bus, addr: d.addr });
+      else if (d.proto === 'spi') await call('spi.ident', { cs: d.addr });
       else { if (!canActive()) await setCanMode('normal'); await call('j1939.request', { pgn: 65259, da: d.addr }); }
       toast('Identification refreshed', 'ok'); refreshSelected();
     } catch (e) { if (e.message !== 'Cancelled') fail(e); }
@@ -1339,6 +1547,210 @@ function drawerObjects(d) {
   return out;
 }
 
+// ---------------------------------------------------------------- trend chart
+
+// Select a history series (watch item or driver value) for the large chart.
+function selectChart(hk, label, unit) {
+  S.chartSel = S.chartSel && S.chartSel.hk === hk ? null : { hk, label, unit };
+  const ch = $('#dChart');
+  if (ch) renderChart(ch);
+}
+function chartSpark(hk, label, unit) {
+  const wrap = h('button', { class: 'spark-btn' + (S.chartSel && S.chartSel.hk === hk ? ' on' : ''), title: 'Show graph', onclick: () => selectChart(hk, label, unit) });
+  wrap.append(sparkline(S.watchHist.get(hk)));
+  return wrap;
+}
+function renderChart(el) {
+  const sel = S.chartSel;
+  if (!sel || !S.devices.get(S.selected) || !sel.hk.startsWith(S.selected + '|')) { el.replaceChildren(h('p', { class: 'hint' }, 'Select a trend to show its graph.')); return; }
+  const pts = S.watchHist.get(sel.hk) || [];
+  const W = 520, H = 210, l = 52, r = 14, t = 16, b = 28;
+  const kids = [];
+  kids.push(sv('rect', { x: l, y: t, width: W - l - r, height: H - t - b, class: 'ch-bg' }));
+  if (pts.length < 2) {
+    kids.push(sv('text', { x: W / 2, y: H / 2, 'text-anchor': 'middle', class: 'ch-lbl' }, 'Collecting data…'));
+  } else {
+    const vs = pts.map(p => p.v);
+    let mn = Math.min(...vs), mx = Math.max(...vs);
+    if (mx - mn < 1e-9) { mn -= 1; mx += 1; }
+    const pad = (mx - mn) * 0.08; mn -= pad; mx += pad;
+    const t0 = pts[0].ts, t1 = pts[pts.length - 1].ts, span = Math.max(1, t1 - t0);
+    const X = ts => l + (ts - t0) / span * (W - l - r);
+    const Y = v => t + (1 - (v - mn) / (mx - mn)) * (H - t - b);
+    for (let i = 0; i <= 4; i++) {
+      const v = mn + (mx - mn) * i / 4, y = Y(v);
+      kids.push(sv('line', { x1: l, x2: W - r, y1: y, y2: y, class: 'ch-grid' }),
+        sv('text', { x: l - 6, y: y + 4, 'text-anchor': 'end', class: 'ch-lbl' }, fmtValue(+v.toPrecision(4))));
+    }
+    for (let i = 0; i <= 4; i++) {
+      const ts = t0 + span * i / 4, x = X(ts);
+      kids.push(sv('text', { x, y: H - 8, 'text-anchor': i === 0 ? 'start' : i === 4 ? 'end' : 'middle', class: 'ch-lbl' },
+        i === 4 ? 'now' : `−${Math.round((t1 - ts) / 1000)} s`));
+    }
+    kids.push(sv('path', { class: 'ch-line', d: pts.map((p, i) => `${i ? 'L' : 'M'}${X(p.ts).toFixed(1)} ${Y(p.v).toFixed(1)}`).join(' ') }));
+    const last = pts[pts.length - 1];
+    kids.push(sv('circle', { cx: X(last.ts), cy: Y(last.v), r: 3.5, class: 'ch-dot' }));
+  }
+  const last = pts.length ? pts[pts.length - 1].v : null;
+  const vs = pts.map(p => p.v);
+  el.replaceChildren(
+    h('div', { class: 'row' }, h('b', null, sel.label), h('span', { class: 'spacer' }),
+      h('button', { class: 'btn small ghost', title: 'Export CSV', onclick: () => download(`${sel.label.replace(/\W+/g, '_')}.csv`, 'ms,value\n' + pts.map(p => `${p.ts},${p.v}`).join('\n'), 'text/csv') }, 'CSV')),
+    pts.length ? h('div', { class: 'muted mono', style: { fontSize: '12px', margin: '2px 0 6px' } },
+      `min ${fmtValue(+Math.min(...vs).toPrecision(5))} · max ${fmtValue(+Math.max(...vs).toPrecision(5))} · last ${fmtValue(+last.toPrecision(6), 1, sel.unit)}`) : null,
+    sv('svg', { class: 'big-chart', viewBox: `0 0 ${W} ${H}` }, kids));
+}
+
+// ---------------------------------------------------------------- I2C decoded values
+
+function renderValues(d, tbody) {
+  const vals = d.values || [];
+  if (!vals.length) {
+    tbody.replaceChildren(h('tr', null, h('td', { colspan: 3, class: 'muted' },
+      d.driver ? (d.valsErr ? `Read error (${d.valsErr}). Check the driver matches the device.` : 'Waiting for the first reading…') : 'No driver selected. Choose one above, or use Registers / Watch for raw access.')));
+    return;
+  }
+  tbody.replaceChildren(...vals.map(v => {
+    const hk = `${d.key}|v|${v.n}`;
+    return h('tr', null, h('td', null, v.n), h('td', { class: 'mono' }, h('span', { class: 'val-big' }, fmtValue(+v.v.toPrecision(6), 1, v.u))),
+      h('td', null, chartSpark(hk, `${devName(d)} ${v.n}`, v.u)));
+  }));
+}
+
+function drawerValues(d) {
+  const drivers = (S.hello && S.hello.drivers) || [];
+  const sel = h('select', null, h('option', { value: '' }, 'None'), drivers.map(x => h('option', { value: x.id, selected: x.id === d.driver }, `${x.id} — ${x.name}`)));
+  sel.addEventListener('change', async () => {
+    try { await call('dev.update', { key: d.key, driver: sel.value }); toast(sel.value ? `Driver ${sel.value} selected` : 'Driver removed', 'ok', 1500); refreshSelected(); } catch (e) { fail(e); }
+  });
+  const poll = h('select', null, [[0, 'Off'], [250, '0.25 s'], [500, '0.5 s'], [1000, '1 s'], [2000, '2 s'], [5000, '5 s'], [10000, '10 s'], [60000, '1 min']]
+    .map(([v, t]) => h('option', { value: v, selected: v === (d.pollMs || 0) }, t)));
+  poll.addEventListener('change', async () => { try { await call('dev.update', { key: d.key, pollMs: +poll.value }); } catch (e) { fail(e); } });
+  return [
+    h('div', { class: 'dsec' }, h('div', { class: 'form-grid' },
+      h('label', { class: 'field', style: { gridColumn: '1 / -1' } }, h('span', null, 'Decoding driver'), sel),
+      h('label', { class: 'field' }, h('span', null, 'Poll every'), poll))),
+    h('div', { class: 'dsec' }, h('h4', null, 'Live values'),
+      h('table', { class: 'tbl' }, h('tbody', { id: 'dValues' }))),
+    h('div', { class: 'dsec', id: 'dChart' }),
+  ];
+}
+
+// ---------------------------------------------------------------- I2C registers
+
+function hexDump(bytes, base) {
+  const rows = [];
+  for (let i = 0; i < bytes.length; i += 8) {
+    const chunk = bytes.slice(i, i + 8);
+    rows.push(h('tr', null, h('td', { class: 'mono faint' }, hexAddr(base + i)), h('td', { class: 'mono' }, chunk.map(hex2).join(' ')),
+      h('td', { class: 'mono faint' }, chunk.map(c => c >= 32 && c < 127 ? String.fromCharCode(c) : '·').join(''))));
+  }
+  return h('table', { class: 'tbl' }, h('thead', null, h('tr', null, h('th', null, 'Reg'), h('th', null, 'Data'), h('th', null, 'ASCII'))), h('tbody', null, rows));
+}
+
+function drawerI2cRegs(d) {
+  const st = store('i2creg.' + d.key) || { reg: '0x00', count: 8, wide: false, fmt: 'u8' };
+  const reg = h('input', { value: st.reg, class: 'w-md', placeholder: 'register' });
+  const count = h('input', { type: 'number', min: 1, max: 64, value: st.count, class: 'w-sm' });
+  const wide = h('input', { type: 'checkbox', checked: st.wide });
+  const fmt = h('select', null, Object.entries(RAW_FMTS).map(([k, v]) => h('option', { value: k, selected: k === st.fmt }, v)));
+  const out = h('div');
+  let last = null;
+  const show = () => {
+    if (!last) { out.replaceChildren(h('p', { class: 'hint' }, 'Reads use a repeated start after the register address.')); return; }
+    const f = fmt.value, n = FMT_BYTES[f] || 1;
+    const vals = [];
+    for (let i = 0; i + n <= last.bytes.length && vals.length < 32; i += (f === 'hex' || f === 'str') ? last.bytes.length : n)
+      vals.push([last.reg + i, decodeValue(f, last.bytes.slice(i, f === 'hex' || f === 'str' ? undefined : i + n), 'i2c')]);
+    out.replaceChildren(hexDump(last.bytes, last.reg),
+      h('table', { class: 'tbl', style: { marginTop: '8px' } }, h('tbody', null, vals.map(([a, v]) => h('tr', null,
+        h('td', { class: 'mono faint' }, hexAddr(a)), h('td', { class: 'mono' }, fmtValue(v)),
+        h('td', null, rawWatchBtn(d, a, f, wide.checked ? 2 : 1)))))));
+  };
+  const parseReg = () => { const r = parseNum(reg.value); if (isNaN(r) || r < 0 || r > (wide.checked ? 0xFFFF : 0xFF)) throw new Error('Register out of range'); return r; };
+  const doRead = async () => {
+    try {
+      const r = parseReg();
+      store('i2creg.' + d.key, { reg: reg.value, count: +count.value, wide: wide.checked, fmt: fmt.value });
+      const res = await call('i2c.read', { bus: d.bus, addr: d.addr, reg: r, regBytes: wide.checked ? 2 : 1, count: +count.value });
+      last = { reg: r, bytes: hexBytes(res.rx) };
+      show();
+    } catch (e) { fail(e); }
+  };
+  fmt.addEventListener('change', show);
+  const wreg = h('input', { class: 'w-md', placeholder: 'register' });
+  const wdata = h('input', { placeholder: 'bytes, e.g. 27 or F4 25', style: { flex: 1 } });
+  show();
+  return [
+    h('div', { class: 'dsec' }, h('h4', null, 'Read'),
+      h('div', { class: 'row' }, h('label', { class: 'field' }, h('span', null, 'Register'), reg), h('label', { class: 'field' }, h('span', null, 'Bytes'), count),
+        h('label', { class: 'field', style: { flex: 1 } }, h('span', null, 'Decode as'), fmt),
+        h('button', { class: 'btn primary', style: { alignSelf: 'flex-end' }, onclick: doRead }, 'Read')),
+      h('label', { class: 'check', style: { marginTop: '6px' } }, wide, '16-bit register address (EEPROMs)')),
+    h('div', { class: 'dsec' }, out),
+    h('div', { class: 'dsec' }, h('h4', null, 'Write'),
+      h('div', { class: 'row' }, wreg, wdata, h('button', { class: 'btn', onclick: async () => {
+        try {
+          const r = parseNum(wreg.value); if (isNaN(r)) throw new Error('Register required');
+          if (!await confirmBox(`Write to ${devName(d)}?`, `${hexAddr(d.addr)} register ${hexAddr(r)} ← ${wdata.value}`, 'Write')) return;
+          await call('i2c.write', { bus: d.bus, addr: d.addr, reg: r, regBytes: r > 0xFF ? 2 : 1, hex: wdata.value });
+          toast('Written', 'ok', 1200);
+        } catch (e) { fail(e); }
+      } }, 'Write'))),
+  ];
+}
+
+function rawWatchBtn(d, reg, fmt, regBytes) {
+  return h('button', { class: 'btn small ghost', title: 'Add to watch list', onclick: async () => {
+    const full = S.devices.get(d.key);
+    const watch = (full.watch || []).map(stripWatch);
+    if (watch.length >= 16) return toast('Watch list is full (16 items)', 'err');
+    watch.push({ name: `reg ${hexAddr(reg)}`, fn: 0, addr: reg, sub: regBytes, count: Math.max(1, FMT_BYTES[fmt] || 1), fmt, scale: 1, unit: '' });
+    try { await call('dev.update', { key: d.key, watch, pollMs: full.pollMs || 1000 }); toast('Added to watch list', 'ok', 1500); refreshSelected(); } catch (e) { fail(e); }
+  } }, '+ watch');
+}
+
+// ---------------------------------------------------------------- SPI transfer
+
+function drawerSpi(d) {
+  const tx = h('input', { placeholder: 'MOSI bytes, e.g. 9F 00 00 00', style: { flex: 1 }, value: store('spitx.' + d.key) || '9F 00 00 00' });
+  const res = h('div', { class: 'mono', style: { whiteSpace: 'pre-wrap', minHeight: '2.8em' } });
+  const reg = h('input', { class: 'w-md', placeholder: 'register' });
+  const count = h('input', { type: 'number', min: 1, max: 63, value: 1, class: 'w-sm' });
+  const wdata = h('input', { placeholder: 'bytes', style: { flex: 1 } });
+  const rres = h('div', { class: 'mono', style: { minHeight: '1.4em', marginTop: '6px' } });
+  const rb = busCfg('spi').readBit;
+  return [
+    h('div', { class: 'dsec' }, h('h4', null, 'Full-duplex transfer'),
+      h('div', { class: 'row' }, tx, h('button', { class: 'btn primary', onclick: async () => {
+        try {
+          store('spitx.' + d.key, tx.value);
+          const r = await call('spi.xfer', { cs: d.addr, hex: tx.value });
+          res.textContent = `MOSI ${spaced(r.tx)}\nMISO ${spaced(r.rx)}`;
+        } catch (e) { res.textContent = e.message; }
+      } }, 'Transfer')), res),
+    h('div', { class: 'dsec' }, h('h4', null, 'Registers'),
+      h('div', { class: 'row' }, reg, h('span', { class: 'muted' }, 'bytes'), count,
+        h('button', { class: 'btn', onclick: async () => {
+          try {
+            const r = parseNum(reg.value); if (isNaN(r)) throw new Error('Register required');
+            const x = await call('spi.read', { cs: d.addr, reg: r, count: +count.value });
+            rres.textContent = `${hexAddr(r)}: ${spaced(x.data)}`;
+          } catch (e) { rres.textContent = e.message; }
+        } }, 'Read')),
+      h('div', { class: 'row', style: { marginTop: '6px' } }, wdata, h('button', { class: 'btn', onclick: async () => {
+        try {
+          const r = parseNum(reg.value); if (isNaN(r)) throw new Error('Register required');
+          if (!await confirmBox('Write SPI register?', `CS IO${d.addr} register ${hexAddr(r)} ← ${wdata.value}`, 'Write')) return;
+          await call('spi.write', { cs: d.addr, reg: r, hex: wdata.value });
+          rres.textContent = 'written';
+        } catch (e) { rres.textContent = e.message; }
+      } }, 'Write')),
+      rres,
+      h('p', { class: 'hint' }, rb ? 'Register reads set bit 7 of the address byte (common sensor convention); writes clear it. Change in SPI settings.' : 'Register address sent unmodified.')),
+  ];
+}
+
 // ---------------------------------------------------------------- watch list
 const stripWatch = w => ({ name: w.name, fn: w.fn, addr: w.addr, sub: w.sub, count: w.count, fmt: w.fmt, scale: w.scale, unit: w.unit });
 function sparkline(points) {
@@ -1356,10 +1768,11 @@ function renderWatchValues(d, tbody) {
       if (w.err) val = d.proto === 'canopen' && w.abort ? abortText(w.abort) : (w.err === -1 ? 'timeout' : d.proto === 'modbus' && w.err > 0 ? 'exception ' + w.err : 'error');
       else val = fmtValue(decodeValue(w.fmt, hexBytes(w.raw), d.proto, w.fn), w.scale, w.unit);
     }
-    const src = d.proto === 'modbus' ? `${({ 1: 'coil', 2: 'input', 3: 'hr', 4: 'ir' })[w.fn]} ${w.addr}${w.count > 1 ? '+' + (w.count - 1) : ''}` : `${hex4(w.addr)}:${w.sub}`;
+    const src = d.proto === 'modbus' ? `${({ 1: 'coil', 2: 'input', 3: 'hr', 4: 'ir' })[w.fn]} ${w.addr}${w.count > 1 ? '+' + (w.count - 1) : ''}`
+      : isRawProto(d.proto) ? `${w.sub === 2 ? '0x' + hex4(w.addr) : hexAddr(w.addr)} ×${w.count}` : `${hex4(w.addr)}:${w.sub}`;
     return h('tr', null, h('td', null, w.name || '(unnamed)'), h('td', { class: 'mono faint' }, src),
       h('td', { class: 'mono' }, h('span', { class: w.err ? 'faint' : 'val-big', style: { fontSize: '14px' } }, val)),
-      h('td', null, sparkline(S.watchHist.get(d.key + '|' + i))),
+      h('td', null, chartSpark(d.key + '|' + i, `${devName(d)} ${w.name || ''}`.trim(), w.unit)),
       h('td', null, h('button', { class: 'btn small ghost', title: 'Remove', onclick: async () => {
         const watch = ws.map(stripWatch); watch.splice(i, 1);
         try { await call('dev.update', { key: d.key, watch }); refreshSelected(); } catch (e) { fail(e); }
@@ -1381,6 +1794,16 @@ function drawerWatch(d) {
     const fillFmt = () => fmt.replaceChildren(...Object.entries(MB_FMTS).filter(([k]) => (+fn.value <= 2) === (k === 'bool' || k === 'hex')).map(([k, v]) => h('option', { value: k }, v)));
     fn.addEventListener('change', fillFmt); fillFmt();
     src = { nodes: [fn, addr], get: () => { const f = fmt.value; return { fn: +fn.value, addr: +addr.value, count: +fn.value <= 2 ? 1 : (FMT_WORDS[f] || 1), fmt: f }; } };
+  } else if (isRawProto(d.proto)) {
+    const reg = h('input', { placeholder: 'register (hex)', class: 'w-md' });
+    const bytes = h('input', { type: 'number', min: 1, max: 16, value: 2, class: 'w-sm', title: 'Bytes to read' });
+    fmt.replaceChildren(...Object.entries(RAW_FMTS).map(([k, v]) => h('option', { value: k, selected: k === 'u16be' }, v)));
+    fmt.addEventListener('change', () => { bytes.value = FMT_BYTES[fmt.value] || 1; });
+    src = { nodes: [reg, h('span', { class: 'muted' }, 'bytes'), bytes], get: () => {
+      const r = parseNum(reg.value.match(/^0x/i) ? reg.value : '0x' + reg.value);
+      if (isNaN(r) || r < 0 || r > 0xFFFF) throw new Error('Register must be hex 00..FFFF');
+      return { fn: 0, addr: r, sub: r > 0xFF ? 2 : 1, count: clamp(+bytes.value || 1, 1, 16), fmt: fmt.value };
+    } };
   } else {
     const idx = h('input', { placeholder: 'index hex', class: 'w-md' });
     const sub = h('input', { type: 'number', min: 0, max: 255, value: 0, class: 'w-sm' });
@@ -1407,6 +1830,7 @@ function drawerWatch(d) {
     h('div', { class: 'dsec' }, h('h4', null, 'Add item'),
       h('div', { class: 'stack' }, h('div', { class: 'row' }, name), h('div', { class: 'row' }, ...src.nodes, fmt),
         h('div', { class: 'row' }, h('span', { class: 'muted' }, '×'), scale, unit, h('span', { class: 'spacer' }), h('button', { class: 'btn primary', onclick: add }, 'Add')))),
+    h('div', { class: 'dsec', id: 'dChart' }),
   ];
 }
 
@@ -1455,21 +1879,55 @@ function onTrace(m) {
   if (S.trace.length > S.traceMax) S.trace.splice(0, S.trace.length - S.traceMax);
   if (S.view === 'traffic' && !S.tracePaused) appendTraffic(add);
 }
+const TF_NACK = 0x20;
+function decodeI2c(f, bytes) {
+  const bus = BUS_IDS[f.bus];
+  const d = S.devices.get(`${bus}:i2c:${f.id}`);
+  const who = `${hexAddr(f.id)}${d ? ' ' + devName(d) : ''}`;
+  if (f.fl & TF_NACK) return `${f.dir ? 'read' : 'write'} ${who}: NACK`;
+  if (f.dir) return `read ${who}: ${bytes.length} byte${bytes.length === 1 ? '' : 's'}`;
+  if (bytes.length) return `write ${who}: ${bytes.map(hex2).join(' ')}`;
+  return `probe ${who}`;
+}
 function frameText(f) {
   if (f._dec !== undefined) return f._dec;
   const bytes = hexBytes(f.hex);
-  f._dec = f.bus === 0 ? decodeModbus(bytes, f.fl & 4) : decodeCan(f.id, f.fl & 1, bytes, f.fl & 2);
+  switch (BUS_IDS[f.bus]) {
+    case 'rs485': f._dec = decodeModbus(bytes, f.fl & 4); break;
+    case 'can': f._dec = decodeCan(f.id, f.fl & 1, bytes, f.fl & 2); break;
+    case 'qwiic': case 'i2c': f._dec = decodeI2c(f, bytes); break;
+    case 'spi': {
+      const d = S.devices.get(`spi:spi:${f.id}`);
+      f._dec = `${f.dir ? 'MISO' : 'MOSI'} CS IO${f.id}${d ? ' ' + devName(d) : ''}` + (!f.dir && bytes[0] === 0x9F ? ' · JEDEC ID read' : '');
+      break;
+    }
+    default: f._dec = '';
+  }
   return f._dec;
 }
 function frameMatches(f) {
-  const flt = S.traceFilter;
-  if (flt.bus === 'rs485' && f.bus !== 0) return false;
-  if (flt.bus === 'can' && f.bus !== 1) return false;
+  const flt = S.traceFilter, b = BUS_IDS[f.bus];
+  if (flt.bus !== 'all' && !(flt.bus === b || (flt.bus === 'i2c' && b === 'qwiic'))) return false;
   if (!flt.text) return true;
   const q = flt.text.toLowerCase().replace(/^0x/, '');
-  const idStr = f.bus === 1 ? fmtId(f.id, f.fl & 1).toLowerCase() : String(f.id);
+  const idStr = b === 'can' ? fmtId(f.id, f.fl & 1).toLowerCase() : b === 'qwiic' || b === 'i2c' ? hex2(f.id).toLowerCase() : String(f.id);
   if (idStr === q || idStr.replace(/^0+/, '') === q.replace(/^0+/, '')) return true;
   return (f.hex.toLowerCase().includes(q.replace(/\s/g, '')) || frameText(f).toLowerCase().includes(q));
+}
+const BUS_LABEL = { rs485: 'RS485', can: 'CAN', qwiic: 'Qwiic', i2c: 'I²C', spi: 'SPI' };
+function frameId(f) {
+  switch (BUS_IDS[f.bus]) {
+    case 'can': return fmtId(f.id, f.fl & 1) + (f.fl & 2 ? ' R' : '');
+    case 'rs485': return f.hex ? String(f.id) : '';
+    case 'spi': return 'CS' + f.id;
+    default: return hexAddr(f.id);
+  }
+}
+function frameDir(f) {
+  const b = BUS_IDS[f.bus];
+  if (b === 'spi') return f.dir ? 'MISO' : 'MOSI';
+  if (b === 'qwiic' || b === 'i2c') return f.dir ? 'R' : 'W';
+  return f.dir ? 'TX' : 'RX';
 }
 function fmtFrameTime(f) {
   const be = bootEpoch();
@@ -1480,13 +1938,15 @@ function fmtFrameTime(f) {
   return (f.t / 1000).toFixed(3) + ' s';
 }
 function trafficRow(f) {
-  const can = f.bus === 1;
-  const cls = (f.dir ? 'tx' : '') + (!can && !(f.fl & 4) ? ' bad' : '');
+  const b = BUS_IDS[f.bus];
+  const bad = (b === 'rs485' && !(f.fl & 4)) || (f.fl & TF_NACK);
+  const tx = b === 'rs485' || b === 'can' ? f.dir : !f.dir;  // I2C write / SPI MOSI originate here
+  const cls = (tx ? 'tx' : '') + (bad ? ' bad' : '');
   return h('tr', { class: cls },
     h('td', { class: 'mono' }, fmtFrameTime(f)),
-    h('td', { class: can ? 'bus-can' : 'bus-rs485' }, can ? 'CAN' : 'RS485'),
-    h('td', null, f.dir ? 'TX' : 'RX'),
-    h('td', { class: 'mono' }, can ? fmtId(f.id, f.fl & 1) + (f.fl & 2 ? ' R' : '') : (f.hex ? String(f.id) : '')),
+    h('td', { class: 'bus-' + (b === 'qwiic' ? 'i2c' : b) }, BUS_LABEL[b] || b),
+    h('td', null, frameDir(f)),
+    h('td', { class: 'mono' }, frameId(f)),
     h('td', { class: 'mono' }, f.hex.length / 2),
     h('td', { class: 'data' }, spaced(f.hex)),
     h('td', { class: 'dec' }, frameText(f)));
@@ -1495,7 +1955,7 @@ function buildTraffic() {
   const v = $('#view-traffic');
   if (v.dataset.built) return;
   v.dataset.built = '1';
-  const bus = h('div', { class: 'seg' }, ['all', 'rs485', 'can'].map(b => h('button', { 'data-b': b }, b === 'all' ? 'All' : b === 'rs485' ? 'RS485' : 'CAN')));
+  const bus = h('div', { class: 'seg' }, ['all', 'rs485', 'can', 'i2c', 'spi'].map(b => h('button', { 'data-b': b }, b === 'all' ? 'All' : BUS_LABEL[b])));
   bus.addEventListener('click', e => { const b = e.target.closest('button'); if (!b) return; S.traceFilter.bus = b.dataset.b; renderTraffic(true); });
   const filter = h('input', { placeholder: 'Filter: ID, address, bytes or text', style: { width: '280px' }, id: 'trFilter' });
   filter.addEventListener('input', debounce(() => { S.traceFilter.text = filter.value.trim(); renderTraffic(true); }, 200));
@@ -1540,7 +2000,7 @@ function trafficStats() {
 }
 function exportCsv() {
   const rows = [['time', 'ms_since_boot', 'bus', 'dir', 'id', 'ext', 'len', 'data', 'decoded']];
-  for (const f of S.trace) if (frameMatches(f)) rows.push([fmtFrameTime(f), f.t.toFixed(3), f.bus ? 'CAN' : 'RS485', f.dir ? 'TX' : 'RX', f.bus ? fmtId(f.id, f.fl & 1) : f.id, f.fl & 1 ? 1 : 0, f.hex.length / 2, f.hex, frameText(f)]);
+  for (const f of S.trace) if (frameMatches(f)) rows.push([fmtFrameTime(f), f.t.toFixed(3), BUS_LABEL[BUS_IDS[f.bus]], frameDir(f), frameId(f), f.fl & 1 ? 1 : 0, f.hex.length / 2, f.hex, frameText(f)]);
   download(`wonderscope-trace-${new Date().toISOString().replace(/[:.]/g, '-')}.csv`, rows.map(r => r.map(c => /[",\n]/.test(String(c)) ? `"${String(c).replace(/"/g, '""')}"` : c).join(',')).join('\n'), 'text/csv');
 }
 
@@ -1591,7 +2051,7 @@ function renderIds() {
 // =====================================================================
 // Console (same commands as the USB serial console)
 // =====================================================================
-const COMMANDS = ['help', 'clear', 'status', 'info', 'rs485', 'can', 'scan', 'devices', 'dev', 'ids', 'mb', 'rs485send', 'sdo', 'nmt', 'co', 'j1939', 'cansend', 'trace', 'wifi', 'auth', 'time', 'reboot', 'factory-reset'];
+const COMMANDS = ['help', 'clear', 'status', 'info', 'rs485', 'can', 'scan', 'devices', 'dev', 'ids', 'mb', 'rs485send', 'sdo', 'nmt', 'co', 'j1939', 'i2c', 'spi', 'pins', 'cansend', 'trace', 'wifi', 'auth', 'time', 'reboot', 'factory-reset'];
 const Console = {
   built: false, hist: store('hist') || [], hIdx: -1, pending: new Map(), lines: 0, tracing: false,
   build() {
@@ -1681,7 +2141,7 @@ const Console = {
 // with unapplied edits (or focus) untouched. Password fields are not synced.
 function syncForms() {
   if (!S.form || !S.hello) return;
-  const src = { rs485: busCfg('rs485'), can: busCfg('can'), wifi: S.hello.settings.wifi, auth: S.hello.settings.auth };
+  const src = { rs485: busCfg('rs485'), can: busCfg('can'), qwiic: busCfg('qwiic'), i2c: busCfg('i2c'), spi: busCfg('spi'), wifi: S.hello.settings.wifi, auth: S.hello.settings.auth };
   for (const [group, fields] of Object.entries(S.form)) {
     const cfg = src[group] || {};
     for (const [key, el] of Object.entries(fields)) {
@@ -1736,9 +2196,22 @@ function renderSettings() {
   const host = h('input', { value: w.hostname, maxlength: 32 });
   // Auth
   const aUser = h('input', { value: st.auth.user, maxlength: 16 });
+  // Expansion buses
+  const i2cHz = v => h('select', null, [[100000, '100 kHz'], [400000, '400 kHz'], [1000000, '1 MHz']].map(([x, t]) => h('option', { value: x, selected: x === v }, t)));
+  const q = busCfg('qwiic'), hi = busCfg('i2c'), sp = busCfg('spi');
+  const qEn = h('input', { type: 'checkbox', checked: q.enabled }), qHz = i2cHz(q.hz), qAuto = h('input', { type: 'checkbox', checked: q.autoScan });
+  const hEn = h('input', { type: 'checkbox', checked: hi.enabled }), hHz = i2cHz(hi.hz), hAuto = h('input', { type: 'checkbox', checked: hi.autoScan });
+  const sEn = h('input', { type: 'checkbox', checked: sp.enabled });
+  const sHz = h('input', { value: sp.hz, class: 'w-md', title: 'Hz, e.g. 1000000' });
+  const sMode = h('select', null, [0, 1, 2, 3].map(m => h('option', { value: m, selected: m === sp.mode }, 'Mode ' + m)));
+  const sCs = h('input', { value: (sp.cs || []).join(','), class: 'w-md', title: 'GPIO numbers, comma-separated' });
+  const sRb = h('input', { type: 'checkbox', checked: sp.readBit });
   S.form = {
     rs485: { enabled: rEn, baud: rBaud, parity: rPar, stop: rStop, timeoutMs: rTmo, scanTimeoutMs: rScan },
     can: { enabled: cEn, bitrate: cBr, mode: cMode, autoRecover: cRec, canopenPassive: cCo, j1939Passive: cJ, j1939Sa: cSa, sdoTimeoutMs: cSdo, scanTimeoutMs: cScan },
+    qwiic: { enabled: qEn, hz: qHz, autoScan: qAuto },
+    i2c: { enabled: hEn, hz: hHz, autoScan: hAuto },
+    spi: { enabled: sEn, hz: sHz, mode: sMode, cs: sCs, readBit: sRb },
     wifi: { apSsid, staSsid, hostname: host },
     auth: { user: aUser },
   };
@@ -1812,9 +2285,24 @@ function renderSettings() {
         h('button', { class: 'btn primary', onclick: save('auth.config', () => ({ user: aUser.value, pass: aPass.value }), 'Login settings saved') }, 'Save'),
         st.auth.enabled ? h('button', { class: 'btn', onclick: save('auth.config', () => ({ pass: '' }), 'Login disabled') }, 'Disable login') : null),
       h('p', { class: 'hint' }, st.auth.enabled ? 'Login is enabled.' : 'No login required. Set a password on shared networks.')),
+    card('Expansion: I²C and SPI',
+      h('div', { class: 'xsec' }, h('label', { class: 'check' }, qEn, h('b', null, 'Qwiic I²C'), h('span', { class: 'muted' }, ' · SDA IO2, SCL IO1')),
+        h('div', { class: 'row' }, qHz, h('label', { class: 'check' }, qAuto, 'Detect added and removed devices'),
+          h('span', { class: 'spacer' }), h('button', { class: 'btn small primary', onclick: () => applyBus('qwiic', { enabled: qEn.checked, hz: +qHz.value, autoScan: qAuto.checked }, 'Qwiic settings applied') }, 'Apply'))),
+      h('div', { class: 'xsec' }, h('label', { class: 'check' }, hEn, h('b', null, 'Header I²C'), h('span', { class: 'muted' }, ' · SDA IO8, SCL IO9')),
+        h('div', { class: 'row' }, hHz, h('label', { class: 'check' }, hAuto, 'Detect added and removed devices'),
+          h('span', { class: 'spacer' }), h('button', { class: 'btn small primary', onclick: () => applyBus('i2c', { enabled: hEn.checked, hz: +hHz.value, autoScan: hAuto.checked }, 'Header I²C settings applied') }, 'Apply'))),
+      h('div', { class: 'xsec' }, h('label', { class: 'check' }, sEn, h('b', null, 'SPI'), h('span', { class: 'muted' }, ' · SCK IO12, MOSI IO11, MISO IO13')),
+        h('div', { class: 'row' }, h('label', { class: 'field' }, h('span', null, 'Clock (Hz)'), sHz), h('label', { class: 'field' }, h('span', null, 'Mode'), sMode),
+          h('label', { class: 'field' }, h('span', null, 'CS GPIOs'), sCs)),
+        h('div', { class: 'row' }, h('label', { class: 'check' }, sRb, 'Register reads set bit 7'), h('span', { class: 'spacer' }),
+          h('button', { class: 'btn small primary', onclick: () => applyBus('spi', { enabled: sEn.checked, hz: +sHz.value, mode: +sMode.value, readBit: sRb.checked,
+            cs: sCs.value.split(/[\s,]+/).filter(Boolean).map(x => +x.replace(/^io/i, '')) }, 'SPI settings applied') }, 'Apply'))),
+      pinDiagram(null),
+      h('p', { class: 'hint' }, '3.3 V logic, not 5 V tolerant, not isolated from the ESP32. Allowed CS pins: IO3–IO8, IO10, IO14.')),
     card('Appearance', field('Theme', theme)),
     card('Device list',
-      h('p', { class: 'muted', style: { margin: 0 } }, `${S.devices.size} devices. Labels, notes, link settings and watch lists are stored on the board.`),
+      h('p', { class: 'muted', style: { margin: 0 } }, h('span', { id: 'setDevCount' }, `${S.devices.size} devices`), '. Labels, notes, link settings and watch lists are stored on the board.'),
       h('div', { class: 'row' },
         h('a', { class: 'btn', href: '/api/devices.json', download: 'wonderscope-devices.json' }, 'Export'),
         h('button', { class: 'btn', onclick: () => importFile.click() }, 'Import…'), importFile,

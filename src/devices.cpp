@@ -59,7 +59,8 @@ void dev_init() {
   devs = (Device *)heap_caps_calloc(MAX_DEVICES, sizeof(Device), MALLOC_CAP_SPIRAM);
   pushedVer = (uint32_t *)heap_caps_calloc(MAX_DEVICES, sizeof(uint32_t), MALLOC_CAP_SPIRAM);
   mtx = xSemaphoreCreateRecursiveMutex();
-  fsOk = LittleFS.begin(true);
+  // Partition label must match partitions.csv ("littlefs"); the library default is "spiffs".
+  fsOk = LittleFS.begin(true, "/littlefs", 10, "littlefs");
   if (!fsOk) {
     Serial.println("[dev] LittleFS mount failed; device list will not persist");
     return;
@@ -214,6 +215,18 @@ void dev_to_json(const Device &d, JsonObject o, bool full) {
   }
   o["pollMs"] = d.pollMs;
   o["nWatch"] = d.nWatch;
+  if (d.driver[0]) o["driver"] = d.driver;
+  if (d.nVals) {
+    JsonArray va = o["values"].to<JsonArray>();
+    for (int i = 0; i < d.nVals; i++) {
+      JsonObject v = va.add<JsonObject>();
+      v["n"] = d.vals[i].name;
+      v["u"] = d.vals[i].unit;
+      v["v"] = d.vals[i].v;
+    }
+    o["vts"] = d.valsTs;
+  }
+  if (d.valsErr) o["valsErr"] = d.valsErr;
   if (!full) return;
   o["notes"] = d.notes;
   JsonArray w = o["watch"].to<JsonArray>();
@@ -279,6 +292,11 @@ static const char *watch_from_json(WatchItem &w, JsonObjectConst o, uint8_t prot
     if (w.count < 1 || w.count > maxCount) return "watch count out of range (regs 1..8, bits 1..64)";
   } else if (proto == PROTO_CANOPEN) {
     w.fn = 0;
+  } else if (proto == PROTO_I2C || proto == PROTO_SPI) {
+    w.fn = 0;
+    if (w.count < 1 || w.count > 16) return "watch count must be 1..16 bytes";
+    if (proto == PROTO_I2C && w.sub != 2) w.sub = 1;
+    if (w.addr > (w.sub == 2 ? 0xFFFF : 0xFF)) return "register address out of range";
   } else {
     return "watch lists are not supported for this protocol";
   }
@@ -316,6 +334,13 @@ const char *dev_apply_meta(uint8_t bus, uint8_t proto, uint8_t addr, JsonObjectC
       }
     }
   }
+  if (!err && m["driver"].is<const char *>() && d->proto == PROTO_I2C) {
+    copy_str(d->driver, sizeof(d->driver), m["driver"]);
+    d->nVals = 0;
+    d->valsErr = 0;
+    if (d->driver[0] && !d->pollMs) d->pollMs = 1000;
+  }
+  if (!err && m["product"].is<const char *>()) copy_str(d->product, sizeof(d->product), m["product"]);
   if (!err && d->proto == PROTO_MODBUS) {
     if (!m["baud"].isNull()) d->baud = m["baud"].as<uint32_t>();
     if (m["parity"].is<const char *>()) {
@@ -369,7 +394,7 @@ bool dev_next_poll(uint8_t bus, uint32_t nowMs, PollTask &out) {
   lock();
   for (int i = 0; i < MAX_DEVICES; i++) {
     Device &d = devs[i];
-    if (!d.used || d.bus != bus || !d.pollMs || !d.nWatch) continue;
+    if (!d.used || d.bus != bus || !d.pollMs || (!d.nWatch && !d.driver[0])) continue;
     if ((int32_t)(nowMs - d.nextPollMs) < 0) continue;
     d.nextPollMs = nowMs + d.pollMs;
     out.bus = d.bus;
@@ -380,11 +405,25 @@ bool dev_next_poll(uint8_t bus, uint32_t nowMs, PollTask &out) {
     out.stop = d.stop;
     out.nWatch = d.nWatch;
     memcpy(out.watch, d.watch, sizeof(WatchItem) * d.nWatch);
+    memcpy(out.driver, d.driver, sizeof(out.driver));
     found = true;
     break;
   }
   unlock();
   return found;
+}
+
+void dev_set_values(uint8_t bus, uint8_t proto, uint8_t addr, const DevValue *vals, uint8_t n, int16_t err) {
+  Device *d = dev_acquire(bus, proto, addr, false);
+  if (!d) return;
+  if (!err) {
+    if (n > MAX_VALUES) n = MAX_VALUES;
+    memcpy(d->vals, vals, sizeof(DevValue) * n);
+    d->nVals = n;
+    d->valsTs = uptime_ms();
+  }
+  d->valsErr = err;
+  dev_release(d, true);
 }
 
 void dev_set_watch_value(uint8_t bus, uint8_t proto, uint8_t addr, uint8_t idx, const uint8_t *raw, uint8_t len,
@@ -484,6 +523,7 @@ static void dev_persist_json(JsonDocument &doc) {
       snprintf(nm, sizeof(nm), "%016llX", (unsigned long long)d.j1939Name);
       o["j1939Name"] = nm;
     }
+    if (d.driver[0]) o["driver"] = d.driver;
     if (d.nWatch) {
       JsonArray w = o["watch"].to<JsonArray>();
       for (int k = 0; k < d.nWatch; k++) watch_to_json(d.watch[k], w.add<JsonObject>(), false);

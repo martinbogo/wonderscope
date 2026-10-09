@@ -77,6 +77,8 @@ static void push_trace(uint32_t &cursor) {
         const TraceFrame &t = buf[k];
         if (subs[i].tbus == 1 && t.bus != BUS_RS485) continue;
         if (subs[i].tbus == 2 && t.bus != BUS_CAN) continue;
+        if (subs[i].tbus == 3 && !bus_is_i2c(t.bus)) continue;
+        if (subs[i].tbus == 4 && t.bus != BUS_SPI) continue;
         if (lines >= TEXT_LINES_MAX) {
           skipped++;
           continue;

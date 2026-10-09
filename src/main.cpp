@@ -4,6 +4,7 @@
 // Tasks:
 //   rs485  (core 1)  owns UART1: sniffing, Modbus master, scans, polling
 //   can    (core 1)  owns TWAI: receive, CANopen/J1939, scans, polling
+//   xbus   (core 1)  owns Wire1 + FSPI: Qwiic/header I2C, SPI, sensor drivers
 //   async_tcp        web server / WebSocket requests -> rpc_dispatch()
 //   loop   (core 1)  serial console, outbound queue, periodic pushes
 
@@ -18,6 +19,7 @@
 #include "trace.h"
 #include "web.h"
 #include "wifi_mgr.h"
+#include "xbus.h"
 
 void setup() {
   Serial.setTxBufferSize(8192);
@@ -31,6 +33,7 @@ void setup() {
   dev_init();
   rs485_begin();
   can_begin();
+  xbus_begin();
   wifi_begin();
   web_begin();
   Serial.printf("[boot] %s %s, RTC %s\n", FW_NAME, FW_VERSION,

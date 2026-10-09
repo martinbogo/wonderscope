@@ -100,6 +100,9 @@ static bool dev_key_arg(const char *s, String &key) {
   if (proto == "mb" || proto == "modbus" || proto == "m") key = "rs485:modbus:";
   else if (proto == "co" || proto == "canopen" || proto == "c") key = "can:canopen:";
   else if (proto == "j" || proto == "j1939") key = "can:j1939:";
+  else if (proto == "qw" || proto == "qwiic" || proto == "q") key = "qwiic:i2c:";
+  else if (proto == "i2c" || proto == "hdr" || proto == "header") key = "i2c:i2c:";
+  else if (proto == "spi" || proto == "cs") key = "spi:spi:";
   else return false;
   key += a;
   return true;
@@ -168,6 +171,7 @@ static bool cmd_help(Args &a, Ctx &c) {
       {"Modbus RTU (RS485)", "mb"},
       {"CANopen", "sdo nmt co"},
       {"J1939", "j1939"},
+      {"I2C / SPI expansion", "i2c spi pins"},
       {"Raw frames", "cansend rs485send trace"},
       {"System", "wifi auth time reboot factory-reset"},
   };
@@ -187,6 +191,7 @@ static bool cmd_help(Args &a, Ctx &c) {
   }
   c.out +=
       "Device keys: mb17 (Modbus addr 17), co5 (CANopen node 5), j0 (J1939 SA 0),\n"
+      "             qwiic:0x76, i2c:0x44 (header I2C), spi:10 (CS GPIO),\n"
       "             or the full form rs485:modbus:17.\n"
       "Numbers: decimal or 0x-hex. CAN IDs and CANopen indices are always hex.";
   return false;
@@ -408,10 +413,200 @@ static bool cmd_dev(Args &a, Ctx &c) {
   } else if (!strcasecmp(sub, "add")) {
     REQ(c, "dev.add");
     render_as(c, "dev.get");
+  } else if (!strcasecmp(sub, "driver")) {
+    if (a.n <= ki + 1) return usage_err(c, nullptr);
+    REQ(c, "dev.update");
+    c.req["driver"] = a.is(ki + 1, "none") ? "" : a[ki + 1];
+    render_as(c, "dev.get");
   } else {
     return usage_err(c, sub);
   }
   return true;
+}
+
+// ---------------------------------------------------------------- I2C / SPI
+
+// "qwiic" (default) or "header"/"i2c"
+static const char *i2c_bus_word(const char *s, bool &matched) {
+  matched = true;
+  if (!strcasecmp(s, "qwiic") || !strcasecmp(s, "qw")) return "qwiic";
+  if (!strcasecmp(s, "header") || !strcasecmp(s, "hdr") || !strcasecmp(s, "i2c")) return "i2c";
+  matched = false;
+  return "qwiic";
+}
+
+static bool cmd_i2c(Args &a, Ctx &c) {
+  if (a.n == 1) {
+    REQ(c, "status");
+    render_as(c, "show.i2c");
+    return true;
+  }
+  bool m;
+  if (a.is(1, "scan")) {
+    REQ(c, "scan");
+    const char *b = a.n > 2 ? i2c_bus_word(a[2], m) : "qwiic";
+    c.req["bus"] = b;
+    c.out = String("Scanning ") + (strcmp(b, "qwiic") ? "header I2C (IO8/IO9)" : "Qwiic I2C (IO2/IO1)") + " 0x08-0x77...";
+    render_as(c, "i2c.scan");
+    return true;
+  }
+  const char *bus = i2c_bus_word(a[1], m);
+  if (m && a.n > 2 && (a.is(2, "on") || a.is(2, "off") || a.is(2, "autoscan") || isdigit((unsigned char)a[2][0]))) {
+    REQ(c, strcmp(bus, "qwiic") ? "i2c.config" : "qwiic.config");
+    for (int i = 2; i < a.n; i++) {
+      if (a.is(i, "on")) c.req["enabled"] = true;
+      else if (a.is(i, "off")) c.req["enabled"] = false;
+      else if (a.is(i, "autoscan") && i + 1 < a.n) c.req["autoScan"] = a.is(++i, "on");
+      else c.req["hz"] = a[i];
+    }
+    render_as(c, "show.i2cbus");
+    return true;
+  }
+  // i2c read|write|xfer|ident <bus> <addr> ...
+  const char *op = a[1];
+  int bi = 2;
+  bus = i2c_bus_word(a[bi], m);
+  if (!m) return usage_err(c, a[bi]);
+  long addr, reg, n;
+  if (!num(a[bi + 1], addr)) return usage_err(c, a[bi + 1]);
+  c.req["bus"] = bus;
+  c.req["addr"] = addr;
+  if (!strcasecmp(op, "ident") || !strcasecmp(op, "probe")) {
+    REQ(c, "i2c.ident");
+    render_as(c, "i2c.ident");
+  } else if (!strcasecmp(op, "read") || !strcasecmp(op, "r")) {
+    REQ(c, "i2c.read");
+    if (a.n > bi + 2) {
+      if (!num(a[bi + 2], reg)) return usage_err(c, a[bi + 2]);
+      c.req["reg"] = reg;
+      if (reg > 0xFF) c.req["regBytes"] = 2;
+    }
+    if (a.n > bi + 3) {
+      if (!num(a[bi + 3], n)) return usage_err(c, a[bi + 3]);
+      c.req["count"] = n;
+    }
+    render_as(c, "i2c.rw");
+  } else if (!strcasecmp(op, "write") || !strcasecmp(op, "w")) {
+    if (a.n < bi + 4 || !num(a[bi + 2], reg)) return usage_err(c, nullptr);
+    REQ(c, "i2c.write");
+    c.req["reg"] = reg;
+    if (reg > 0xFF) c.req["regBytes"] = 2;
+    String hex;
+    for (int i = bi + 3; i < a.n; i++) hex += String(a[i]) + " ";
+    c.req["hex"] = hex;
+    render_as(c, "i2c.rw");
+  } else if (!strcasecmp(op, "xfer")) {
+    REQ(c, "i2c.xfer");
+    String hex;
+    for (int i = bi + 2; i < a.n; i++) {
+      if (a.is(i, "r") && num(a[i + 1], n)) {
+        c.req["count"] = n;
+        i++;
+      } else hex += String(a[i]) + " ";
+    }
+    c.req["hex"] = hex;
+    render_as(c, "i2c.rw");
+  } else {
+    return usage_err(c, op);
+  }
+  return true;
+}
+
+static bool cmd_spi(Args &a, Ctx &c) {
+  if (a.n == 1) {
+    REQ(c, "status");
+    render_as(c, "show.spi");
+    return true;
+  }
+  long cs, reg, n;
+  if (a.is(1, "scan")) {
+    REQ(c, "scan");
+    c.req["bus"] = "spi";
+    render_as(c, "spi.scan");
+    return true;
+  }
+  if (a.is(1, "xfer") || a.is(1, "read") || a.is(1, "write") || a.is(1, "ident")) {
+    if (!num(a[2], cs)) return usage_err(c, a[2]);
+    c.req["cs"] = cs;
+    if (a.is(1, "ident")) {
+      REQ(c, "spi.ident");
+      render_as(c, "spi.ident");
+      return true;
+    }
+    if (a.is(1, "xfer")) {
+      REQ(c, "spi.xfer");
+      String hex;
+      for (int i = 3; i < a.n; i++) hex += String(a[i]) + " ";
+      c.req["hex"] = hex;
+    } else {
+      if (!num(a[3], reg)) return usage_err(c, a[3]);
+      c.req["reg"] = reg;
+      if (a.is(1, "read")) {
+        REQ(c, "spi.read");
+        if (a.n > 4) {
+          if (!num(a[4], n)) return usage_err(c, a[4]);
+          c.req["count"] = n;
+        }
+      } else {
+        REQ(c, "spi.write");
+        String hex;
+        for (int i = 4; i < a.n; i++) hex += String(a[i]) + " ";
+        if (!hex.length()) return usage_err(c, nullptr);
+        c.req["hex"] = hex;
+      }
+    }
+    render_as(c, "spi.rw");
+    return true;
+  }
+  REQ(c, "spi.config");
+  for (int i = 1; i < a.n; i++) {
+    long v;
+    if (a.is(i, "on")) c.req["enabled"] = true;
+    else if (a.is(i, "off")) c.req["enabled"] = false;
+    else if (a.is(i, "mode") && num(a[i + 1], v)) c.req["mode"] = v, i++;
+    else if (a.is(i, "readbit") && i + 1 < a.n) c.req["readBit"] = a.is(++i, "on");
+    else if (a.is(i, "cs") && i + 1 < a.n) {
+      JsonArray arr = c.req["cs"].to<JsonArray>();
+      String list(a[++i]);
+      int s = 0;
+      while (s < (int)list.length()) {
+        int e = list.indexOf(',', s);
+        if (e < 0) e = list.length();
+        if (!num(list.substring(s, e).c_str(), v)) return usage_err(c, a[i]);
+        arr.add(v);
+        s = e + 1;
+      }
+    } else if (isdigit((unsigned char)a[i][0])) c.req["hz"] = a[i];
+    else return usage_err(c, a[i]);
+  }
+  render_as(c, "show.spibus");
+  return true;
+}
+
+static const char PIN_DIAGRAM[] =
+    "Qwiic connector (SH1.0, beside USB-C)\n"
+    "  GND   3V3   SDA = IO2   SCL = IO1\n"
+    "\n"
+    "Pin header, 2x10, 2.0 mm pitch (inside the case; power terminal end at top)\n"
+    "\n"
+    "                    3V3   o o   5V\n"
+    "                    GND   o o   GND\n"
+    "        UART0 TX   IO43   o o   IO20   USB D+  (do not use)\n"
+    "        UART0 RX   IO44   o o   IO19   USB D-  (do not use)\n"
+    "        SPI CS*     IO3   o o   IO14   SPI CS*\n"
+    "        SPI CS*     IO4   o o   IO13   SPI MISO\n"
+    "        SPI CS*     IO5   o o   IO12   SPI SCK\n"
+    "        SPI CS*     IO6   o o   IO11   SPI MOSI\n"
+    "        SPI CS*     IO7   o o   IO10   SPI CS (default)\n"
+    "        I2C SDA     IO8   o o   IO9    I2C SCL\n"
+    "\n"
+    "  * optional additional chip selects ('spi cs 10,5')\n"
+    "  Logic level 3.3 V, not 5 V tolerant. These pins are not isolated.\n"
+    "  The 5V pin is a supply output. Fit 2.2-4.7 kOhm I2C pull-ups for long or fast buses.";
+
+static bool cmd_pins(Args &, Ctx &c) {
+  c.out = PIN_DIAGRAM;
+  return false;
 }
 
 static bool cmd_ids(Args &a, Ctx &c) {
@@ -659,12 +854,15 @@ static bool cmd_trace(Args &a, Ctx &c) {
     else if (a.is(i, "on")) on = true;
     else if (a.is(i, "rs485")) busSel = 1;
     else if (a.is(i, "can")) busSel = 2;
+    else if (a.is(i, "i2c") || a.is(i, "qwiic")) busSel = 3;
+    else if (a.is(i, "spi")) busSel = 4;
     else if (a.is(i, "all")) busSel = 0;
     else return usage_err(c, a[i]);
   }
   t["textTrace"] = on;
   t["textBus"] = busSel;
-  c.out = on ? String("Live trace ON") + (busSel == 1 ? " (RS485)" : busSel == 2 ? " (CAN)" : " (all buses)") +
+  static const char *const SEL[] = {" (all buses)", " (RS485)", " (CAN)", " (I2C)", " (SPI)"};
+  c.out = on ? String("Live trace ON") + SEL[busSel] +
                    "; 'trace off' to stop."
              : "Live trace off.";
   render_as(c, "silent");
@@ -796,18 +994,53 @@ const CliCmd CMDS[] = {
      "  scan stop",
      cmd_scan},
     {"devices", "devices [rs485|can]", "List discovered devices", "Alias: dev list", cmd_devices},
-    {"dev", "dev show|label|poll|rm|add <key> [...] | dev clear [bus]", "Inspect or edit one device",
-     "dev show <key>             details, identity and watch values\n"
+    {"dev", "dev show|label|poll|driver|rm|add <key> [...] | dev clear [bus]", "Inspect or edit one device",
+     "dev show <key>             details, identity, decoded values and watch values\n"
      "dev label <key> <text>     give the device a name\n"
-     "dev poll <key> <ms|off>    poll its watch list (set watch items in the dashboard)\n"
+     "dev poll <key> <ms|off>    poll its driver / watch list\n"
+     "dev driver <key> <name|none>  set the I2C decoding driver (see 'help i2c')\n"
      "dev add <key>              add a device manually (e.g. not answering scans)\n"
      "dev rm <key>               forget a device\n"
-     "dev clear [rs485|can]      forget all devices\n"
-     "Keys: mb17, co5, j0 or rs485:modbus:17\n"
+     "dev clear [bus]            forget all devices (rs485|can|qwiic|i2c|spi)\n"
+     "Keys: mb17, co5, j0, qwiic:0x76, i2c:0x44, spi:10 or rs485:modbus:17\n"
      "Examples:\n"
      "  dev show mb17\n"
-     "  dev label co5 \"Left drive\"",
+     "  dev label co5 \"Left drive\"\n"
+     "  dev driver qwiic:0x76 bme280",
      cmd_dev},
+    {"i2c", "i2c | i2c scan [qwiic|header] | i2c <bus> on|off [100k|400k|1m] | i2c read|write|xfer|ident <bus> <addr> ...",
+     "I2C on the Qwiic connector and the pin header",
+     "Buses: qwiic  Qwiic / SH1.0 connector, SDA IO2, SCL IO1 (enabled by default)\n"
+     "       header pin header, SDA IO8, SCL IO9 (wire internally, then 'i2c header on')\n"
+     "i2c scan [qwiic|header]           probe 0x08-0x77 and identify devices\n"
+     "i2c <bus> on|off [100k|400k|1m] [autoscan on|off]\n"
+     "i2c ident <bus> <addr>            probe and identify one address\n"
+     "i2c read <bus> <addr> [reg] [n]   read n bytes (from register reg)\n"
+     "i2c write <bus> <addr> <reg> <byte...>\n"
+     "i2c xfer <bus> <addr> <hex...> [r <n>]  write then read with repeated start\n"
+     "Registers above 0xFF are sent as 16-bit addresses.\n"
+     "Decoding drivers: bme280 bmp280 sht3x sht4x aht20 bh1750 tmp102 mcp9808 ina219\n"
+     "                  mpu6050 mpu6500 scd4x. Assigned automatically when identified.\n"
+     "Qwiic is probed every 5 s, so devices appear when plugged in.\n"
+     "Examples:\n"
+     "  i2c scan\n"
+     "  i2c read qwiic 0x76 0xD0 1\n"
+     "  i2c header on 400k",
+     cmd_i2c},
+    {"spi", "spi | spi on|off [hz] [mode 0-3] [cs 10,5] | spi scan | spi xfer|read|write|ident <cs> ...",
+     "SPI on the pin header",
+     "Pins: SCK IO12, MOSI IO11, MISO IO13, CS IO10 (default). Extra CS: IO3-IO8, IO14.\n"
+     "spi on [1m] [mode 0] [cs 10,5]    enable and configure\n"
+     "spi scan                          probe each CS for JEDEC flash and sensor IDs\n"
+     "spi xfer <cs> <hex...>            full-duplex transfer, prints MISO\n"
+     "spi read <cs> <reg> [n]           register read (bit 7 set unless 'readbit off')\n"
+     "spi write <cs> <reg> <byte...>\n"
+     "Examples:\n"
+     "  spi on 4m cs 10\n"
+     "  spi xfer 10 9F 00 00 00\n"
+     "  spi read 10 0xD0",
+     cmd_spi},
+    {"pins", "pins", "Expansion pin diagram (Qwiic, pin header)", "", cmd_pins},
     {"ids", "ids [clear]", "Table of every CAN identifier seen (count, rate, last data)", "", cmd_ids},
     {"mb", "mb read|write|ident|raw ...", "Modbus RTU master requests",
      "mb read <addr> <table> <start> [count]\n"
@@ -1010,6 +1243,30 @@ static String status_can(JsonObjectConst c) {
   return b;
 }
 
+static String hz_text(uint32_t hz) {
+  if (hz >= 1000000 && hz % 1000000 == 0) return String(hz / 1000000) + "M";
+  if (hz >= 1000) return String(hz / 1000) + "k";
+  return String(hz);
+}
+
+static String status_i2c(const char *label, JsonObjectConst q) {
+  char b[200];
+  snprintf(b, sizeof(b), "%-6s %s  %s  SDA IO%d SCL IO%d  autoscan %s  rx %lu  tx %lu  nack %lu", label,
+           q["enabled"] ? "ON " : "OFF", hz_text(q["hz"] | 0).c_str(), (int)(q["sda"] | 0), (int)(q["scl"] | 0),
+           (q["autoScan"] | false) ? "on" : "off", (unsigned long)(q["rx"] | 0), (unsigned long)(q["tx"] | 0),
+           (unsigned long)(q["err"] | 0));
+  return b;
+}
+
+static String status_spi(JsonObjectConst s) {
+  String cs;
+  for (JsonVariantConst v : s["cs"].as<JsonArrayConst>()) cs += (cs.length() ? "," : "") + String("IO") + (int)v;
+  char b[200];
+  snprintf(b, sizeof(b), "SPI    %s  %s mode %d  SCK IO12 MOSI IO11 MISO IO13  CS %s  readbit %s", s["enabled"] ? "ON " : "OFF",
+           hz_text(s["hz"] | 0).c_str(), (int)(s["mode"] | 0), cs.c_str(), (s["readBit"] | true) ? "on" : "off");
+  return b;
+}
+
 static String status_wifi(JsonObjectConst w) {
   String s = String("Wi-Fi  AP \"") + (const char *)(w["ap"]["ssid"] | "") + "\" " + (const char *)(w["ap"]["ip"] | "") +
              " (" + (int)(w["ap"]["clients"] | 0) + " clients)";
@@ -1067,6 +1324,15 @@ static String render_device(JsonObjectConst d, uint32_t now) {
     s += b;
   }
   if (d["notes"].is<const char *>() && strlen(d["notes"])) s += String("  notes      ") + (const char *)d["notes"] + "\n";
+  if (d["driver"].is<const char *>()) {
+    s += String("  driver     ") + (const char *)d["driver"] + "  (poll " +
+         ((int)(d["pollMs"] | 0) ? String((int)d["pollMs"]) + " ms" : String("off")) + ")" +
+         ((int)(d["valsErr"] | 0) ? "  read error" : "") + "\n";
+    for (JsonObjectConst v : d["values"].as<JsonArrayConst>()) {
+      snprintf(b, sizeof(b), "    %-16s %10.3f %s\n", (const char *)(v["n"] | ""), (float)(v["v"] | 0.0f), (const char *)(v["u"] | ""));
+      s += b;
+    }
+  }
   JsonArrayConst w = d["watch"];
   if (w.size()) {
     s += String("  watch list (poll ") + ((int)(d["pollMs"] | 0) ? String((int)d["pollMs"]) + " ms" : String("off")) + ")\n";
@@ -1101,7 +1367,8 @@ String cli_render(const char *cmd, JsonDocument &doc) {
     return String(FW_NAME " up ") + (uint32_t)((o["up"] | 0) / 1000) + "s  heap " + (uint32_t)(o["heap"] | 0) / 1024 +
            "k  psram " + (uint32_t)(o["psram"] | 0) / 1024 + "k  web clients " + (int)(o["clients"] | 0) +
            "  devices " + (int)(o["devices"] | 0) + "\n" + "Time   " + fmt_time(o["epoch"] | (int64_t)0) + "\n" +
-           status_wifi(o["wifi"]) + "\n" + status_rs485(o["rs485"]) + "\n" + status_can(o["can"]);
+           status_wifi(o["wifi"]) + "\n" + status_rs485(o["rs485"]) + "\n" + status_can(o["can"]) + "\n" +
+           status_i2c("Qwiic", o["qwiic"]) + "\n" + status_i2c("I2C", o["i2c"]) + "\n" + status_spi(o["spi"]);
   }
   if (r == "show.rs485" || r == "rs485.config") {
     JsonObjectConst rs = r == "show.rs485" ? o["rs485"].as<JsonObjectConst>() : o;
@@ -1115,6 +1382,39 @@ String cli_render(const char *cmd, JsonDocument &doc) {
     return s;
   }
   if (r == "show.wifi") return status_wifi(o["wifi"]);
+  if (r == "show.i2c") return status_i2c("Qwiic", o["qwiic"]) + "\n" + status_i2c("I2C", o["i2c"]);
+  if (r == "show.i2cbus") return status_i2c((int)(o["sda"] | 0) == pins::QWIIC_SDA ? "Qwiic" : "I2C", o);
+  if (r == "show.spi") return status_spi(o["spi"]);
+  if (r == "show.spibus") return status_spi(o);
+  if (r == "i2c.scan" || r == "spi.scan") {
+    JsonArrayConst f = o["found"];
+    String s = String(o["cancelled"] | false ? "Scan cancelled. " : "Scan complete. ") + f.size() + " device" +
+               (f.size() == 1 ? "" : "s") + " found.\n";
+    for (JsonObjectConst d : f) {
+      if (!d["addr"].isNull())
+        snprintf(b, sizeof(b), "  0x%02X  %-36s %-18s %s\n", (int)d["addr"], (const char *)(d["product"] | "unknown"),
+                 (const char *)(d["vendor"] | ""), d["driver"].is<const char *>() ? (String("driver ") + (const char *)d["driver"]).c_str() : "");
+      else
+        snprintf(b, sizeof(b), "  CS IO%-3d %s %s\n", (int)(d["cs"] | 0), (const char *)(d["product"] | ""), (const char *)(d["vendor"] | ""));
+      s += b;
+    }
+    if (r == "spi.scan" && !f.size()) s += "  No response on any CS (MISO idle). Check wiring and mode.\n";
+    return s;
+  }
+  if (r == "i2c.ident" || r == "spi.ident") {
+    if (!(o["present"] | false)) return r == "i2c.ident" ? String("No ACK.") : String("No response (MISO idle).");
+    String s = String(o["product"] | "present, not identified");
+    if (o["vendor"].is<const char *>()) s += String("  (") + (const char *)o["vendor"] + ")";
+    if (o["driver"].is<const char *>()) s += String("\ndriver ") + (const char *)o["driver"] + " assigned; values in 'dev show'";
+    return s;
+  }
+  if (r == "i2c.rw" || r == "spi.rw") {
+    String s;
+    if (o["tx"].is<const char *>()) s += String(r == "spi.rw" ? "MOSI " : "W ") + (const char *)o["tx"] + "\n";
+    if (o["rx"].is<const char *>()) s += String(r == "spi.rw" ? "MISO " : "R ") + (const char *)o["rx"] + "\n";
+    if (!s.length()) s = "OK";
+    return s;
+  }
   if (r == "show.time" || r == "show.timeset")
     return String("Time   ") + fmt_time(r == "show.time" ? (o["epoch"] | (int64_t)0) : (o["epoch"] | (int64_t)0));
   if (r == "info") {
@@ -1307,6 +1607,11 @@ String cli_trace_line(const TraceFrame &f) {
     n += snprintf(b + n, sizeof(b) - n, (f.flags & TF_EXT) ? "%08lX" : "     %03lX", (unsigned long)f.id);
     if (f.flags & TF_RTR) n += snprintf(b + n, sizeof(b) - n, "  [RTR]");
     else n += snprintf(b + n, sizeof(b) - n, "  [%d] ", f.len);
+  } else if (bus_is_i2c(f.bus)) {
+    n += snprintf(b + n, sizeof(b) - n, "%-5s %s 0x%02lX%s", f.bus == BUS_QWIIC ? "QWIIC" : "I2C", f.dir == DIR_TX ? "W" : "R",
+                  (unsigned long)f.id, (f.flags & TF_NACK) ? " NACK" : "");
+  } else if (f.bus == BUS_SPI) {
+    n += snprintf(b + n, sizeof(b) - n, "SPI   CS%-2lu %s", (unsigned long)f.id, f.dir == DIR_TX ? "MOSI" : "MISO");
   } else {
     n += snprintf(b + n, sizeof(b) - n, "RS485 %s  ", f.dir == DIR_TX ? "TX" : "RX");
   }

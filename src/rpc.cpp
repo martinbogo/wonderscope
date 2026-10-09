@@ -6,12 +6,14 @@
 #include "can.h"
 #include "cli.h"
 #include "devices.h"
+#include "i2c_drivers.h"
 #include "rs485.h"
 #include "rtc.h"
 #include "settings.h"
 #include "trace.h"
 #include "web.h"
 #include "wifi_mgr.h"
+#include "xbus.h"
 
 static uint32_t rebootAtMs, wifiApplyAtMs;
 static bool factoryPending;
@@ -27,6 +29,9 @@ void status_json(JsonObject o) {
   wifi_status_json(o["wifi"].to<JsonObject>());
   rs485_status_json(o["rs485"].to<JsonObject>());
   can_status_json(o["can"].to<JsonObject>());
+  xbus_status_json(BUS_QWIIC, o["qwiic"].to<JsonObject>());
+  xbus_status_json(BUS_I2C, o["i2c"].to<JsonObject>());
+  xbus_status_json(BUS_SPI, o["spi"].to<JsonObject>());
   o["devices"] = dev_count();
   o["traceHead"] = trace_head();
 }
@@ -50,6 +55,13 @@ void hello_json(JsonObject o) {
   o["psramSize"] = ESP.getPsramSize();
   JsonArray br = o["canBitrates"].to<JsonArray>();
   for (size_t i = 0; i < CAN_BITRATE_COUNT; i++) br.add(CAN_BITRATES[i]);
+  JsonArray dr = o["drivers"].to<JsonArray>();
+  for (size_t i = 0; i < DRIVER_COUNT; i++) {
+    JsonObject d = dr.add<JsonObject>();
+    d["id"] = DRIVERS[i].id;
+    d["name"] = DRIVERS[i].name;
+    d["addrs"] = DRIVERS[i].addrs;
+  }
   settings_to_json(o["settings"].to<JsonObject>());
   status_json(o["status"].to<JsonObject>());
 }
@@ -139,6 +151,21 @@ void rpc_dispatch(JsonDocument &req, const ReplyTo &rt) {
     can_submit(j);
     return;
   }
+  if (c == "qwiic.config" || c == "i2c.config" || c == "spi.config") {
+    Settings n = g_settings;
+    const char *err = c == "spi.config" ? spi_settings_from_json(n.spi, req.as<JsonObjectConst>())
+                      : c == "qwiic.config" ? i2c_settings_from_json(n.qwiic, req.as<JsonObjectConst>())
+                                            : i2c_settings_from_json(n.i2c, req.as<JsonObjectConst>());
+    if (!err) err = xbus_validate(n);
+    if (err) return reply_err(rt, "%s", err);
+    g_settings = n;
+    settings_save();
+    Job *j = make_job(req, rt);
+    j->cmd = "xbus.apply";
+    j->args["bus"] = c.substring(0, c.indexOf('.'));
+    xbus_submit(j);
+    return;
+  }
   if (c == "wifi.config") {
     const char *err = wifi_settings_from_json(g_settings.wifi, req.as<JsonObjectConst>());
     if (err) return reply_err(rt, "%s", err);
@@ -200,15 +227,18 @@ void rpc_dispatch(JsonDocument &req, const ReplyTo &rt) {
     const char *bus = req["bus"] | "";
     if (!strcmp(bus, "rs485")) return (void)rs485_submit(make_job(req, rt));
     if (!strcmp(bus, "can")) return (void)can_submit(make_job(req, rt));
-    return reply_err(rt, "scan: bus must be rs485 or can");
+    if (!strcmp(bus, "qwiic") || !strcmp(bus, "i2c") || !strcmp(bus, "spi")) return (void)xbus_submit(make_job(req, rt));
+    return reply_err(rt, "scan: bus must be rs485, can, qwiic, i2c or spi");
   }
   if (c == "scan.cancel") {
     const char *bus = req["bus"] | "";
     if (!*bus || !strcmp(bus, "rs485")) rs485_cancel();
     if (!*bus || !strcmp(bus, "can")) can_cancel();
+    if (!*bus || !strcmp(bus, "qwiic") || !strcmp(bus, "i2c") || !strcmp(bus, "spi")) xbus_cancel();
     return reply_ok(rt);
   }
   if (c.startsWith("mb.")) return (void)rs485_submit(make_job(req, rt));
+  if (c.startsWith("i2c.") || c.startsWith("spi.")) return (void)xbus_submit(make_job(req, rt));
   if (c.startsWith("co.") || c.startsWith("j1939.") || c == "can.send" || c == "can.autobaud" ||
       c == "can.recover" || c == "can.selftest")
     return (void)can_submit(make_job(req, rt));
@@ -236,6 +266,14 @@ void rpc_dispatch(JsonDocument &req, const ReplyTo &rt) {
     if (bus == BUS_CAN && proto == PROTO_MODBUS) return reply_err(rt, "CAN devices are canopen or j1939");
     if (proto == PROTO_CANOPEN && (addr < 1 || addr > 127)) return reply_err(rt, "CANopen node must be 1..127");
     if (proto == PROTO_J1939 && addr > 253) return reply_err(rt, "J1939 address must be 0..253");
+    if (bus_is_i2c(bus) && (proto != PROTO_I2C || addr < 0x03 || addr > 0x77))
+      return reply_err(rt, "I2C devices are i2c:0x03..0x77");
+    if (bus == BUS_SPI && (proto != PROTO_SPI || !spi_cs_allowed(addr)))
+      return reply_err(rt, "SPI devices are spi:<CS GPIO> (IO3-IO8, IO10, IO14)");
+    if ((bus == BUS_RS485 || bus == BUS_CAN) && (proto == PROTO_I2C || proto == PROTO_SPI))
+      return reply_err(rt, "protocol does not match bus");
+    if (req["driver"].is<const char *>() && !driver_known(req["driver"]))
+      return reply_err(rt, "unknown driver '%s'", req["driver"].as<const char *>());
     const char *err = dev_apply_meta(bus, proto, addr, req.as<JsonObjectConst>());
     if (err) return reply_err(rt, "%s", err);
     JsonDocument r;

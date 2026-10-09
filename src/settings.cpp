@@ -46,10 +46,95 @@ void can_settings_to_json(const CanSettings &s, JsonObject o) {
   o["scanTimeoutMs"] = s.scanTimeoutMs;
 }
 
+void i2c_settings_to_json(const I2cBusSettings &s, JsonObject o) {
+  o["enabled"] = s.enabled;
+  o["hz"] = s.hz;
+  o["autoScan"] = s.autoScan;
+}
+
+void spi_settings_to_json(const SpiSettings &s, JsonObject o) {
+  o["enabled"] = s.enabled;
+  o["hz"] = s.hz;
+  o["mode"] = s.mode;
+  JsonArray cs = o["cs"].to<JsonArray>();
+  for (int i = 0; i < s.nCs; i++) cs.add(s.cs[i]);
+  o["readBit"] = s.readBit;
+}
+
+static bool parse_hz(JsonVariantConst v, uint32_t &out) {
+  if (v.is<const char *>()) {
+    String t = v.as<const char *>();
+    t.toLowerCase();
+    float mult = 1;
+    if (t.endsWith("k")) mult = 1e3, t.remove(t.length() - 1);
+    else if (t.endsWith("m")) mult = 1e6, t.remove(t.length() - 1);
+    out = (uint32_t)(t.toFloat() * mult);
+  } else {
+    out = v.as<uint32_t>();
+  }
+  return out > 0;
+}
+
+const char *i2c_settings_from_json(I2cBusSettings &s, JsonObjectConst o) {
+  I2cBusSettings n = s;
+  if (o["enabled"].is<bool>()) n.enabled = o["enabled"];
+  if (o["autoScan"].is<bool>()) n.autoScan = o["autoScan"];
+  if (!o["hz"].isNull()) {
+    uint32_t hz;
+    if (!parse_hz(o["hz"], hz) || (hz != 100000 && hz != 400000 && hz != 1000000))
+      return "I2C clock must be 100k, 400k or 1M";
+    n.hz = hz;
+  }
+  s = n;
+  return nullptr;
+}
+
+bool spi_cs_allowed(uint8_t g) { return (g >= 3 && g <= 8) || g == 10 || g == 14; }
+
+const char *spi_settings_from_json(SpiSettings &s, JsonObjectConst o) {
+  SpiSettings n = s;
+  if (o["enabled"].is<bool>()) n.enabled = o["enabled"];
+  if (o["readBit"].is<bool>()) n.readBit = o["readBit"];
+  if (!o["hz"].isNull()) {
+    uint32_t hz;
+    if (!parse_hz(o["hz"], hz) || hz < 10000 || hz > 40000000) return "SPI clock must be 10k..40M";
+    n.hz = hz;
+  }
+  if (!o["mode"].isNull()) {
+    int m = o["mode"].as<int>();
+    if (m < 0 || m > 3) return "SPI mode must be 0..3";
+    n.mode = m;
+  }
+  if (o["cs"].is<JsonArrayConst>()) {
+    JsonArrayConst a = o["cs"];
+    if (a.size() < 1 || a.size() > SPI_MAX_CS) return "SPI needs 1..4 CS pins";
+    n.nCs = 0;
+    for (JsonVariantConst v : a) {
+      int g = v.as<int>();
+      if (!spi_cs_allowed(g)) return "SPI CS must be one of IO3-IO8, IO10, IO14";
+      for (int i = 0; i < n.nCs; i++)
+        if (n.cs[i] == g) return "duplicate SPI CS pin";
+      n.cs[n.nCs++] = g;
+    }
+  }
+  s = n;
+  return nullptr;
+}
+
+const char *xbus_validate(const Settings &s) {
+  if (s.spi.enabled && s.i2c.enabled)
+    for (int i = 0; i < s.spi.nCs; i++)
+      if (s.spi.cs[i] == pins::HDR_SDA) return "IO8 is header I2C SDA; choose another SPI CS pin";
+  return nullptr;
+}
+
 void settings_to_json(JsonObject o) {
   const Settings &s = g_settings;
   rs485_settings_to_json(s.rs485, o["rs485"].to<JsonObject>());
   can_settings_to_json(s.can, o["can"].to<JsonObject>());
+  i2c_settings_to_json(s.qwiic, o["qwiic"].to<JsonObject>());
+  i2c_settings_to_json(s.i2c, o["i2c"].to<JsonObject>());
+  spi_settings_to_json(s.spi, o["spi"].to<JsonObject>());
   JsonObject w = o["wifi"].to<JsonObject>();
   w["apSsid"] = s.wifi.apSsid;
   w["apHasPass"] = s.wifi.apPass[0] != 0;
@@ -199,6 +284,9 @@ void settings_load() {
       if (!deserializeJson(d, js)) {
         rs485_settings_from_json(s.rs485, d["rs485"]);
         can_settings_from_json(s.can, d["can"]);
+        if (!d["qwiic"].isNull()) i2c_settings_from_json(s.qwiic, d["qwiic"]);
+        if (!d["i2c"].isNull()) i2c_settings_from_json(s.i2c, d["i2c"]);
+        if (!d["spi"].isNull()) spi_settings_from_json(s.spi, d["spi"]);
         wifi_settings_from_json(s.wifi, d["wifi"]);
         auth_settings_from_json(s.auth, d["auth"]);
       }
@@ -212,6 +300,9 @@ void settings_save() {
   JsonDocument d;
   rs485_settings_to_json(s.rs485, d["rs485"].to<JsonObject>());
   can_settings_to_json(s.can, d["can"].to<JsonObject>());
+  i2c_settings_to_json(s.qwiic, d["qwiic"].to<JsonObject>());
+  i2c_settings_to_json(s.i2c, d["i2c"].to<JsonObject>());
+  spi_settings_to_json(s.spi, d["spi"].to<JsonObject>());
   JsonObject w = d["wifi"].to<JsonObject>();
   w["apSsid"] = s.wifi.apSsid;
   w["apPass"] = s.wifi.apPass;

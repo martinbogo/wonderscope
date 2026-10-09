@@ -11,7 +11,10 @@ enum TraceFlags : uint8_t {
   TF_CRC_OK = 0x04,  // RS485: Modbus RTU CRC valid
   TF_ERR = 0x08,     // RS485: parity/framing/overflow seen in this frame
   TF_TRUNC = 0x10,   // frame longer than buffer, truncated
+  TF_NACK = 0x20,    // I2C: address or data not acknowledged
 };
+// I2C frames: DIR_TX = write, DIR_RX = read; id = 7-bit address.
+// SPI frames: DIR_TX = MOSI, DIR_RX = MISO; id = CS GPIO.
 
 constexpr size_t TRACE_MAX_DATA = 256;
 
@@ -34,4 +37,4 @@ void trace_clear();
 struct BusCounters {
   uint32_t rx, tx, err;
 };
-extern BusCounters g_counters[2];
+extern BusCounters g_counters[BUS_COUNT];

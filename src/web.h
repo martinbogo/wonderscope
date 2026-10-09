@@ -18,7 +18,7 @@ enum SubFlags : uint8_t {
 struct SubEntry {
   uint32_t client;
   uint8_t flags;
-  uint8_t tbus;  // text trace filter: 0 all, 1 rs485, 2 can
+  uint8_t tbus;  // text trace filter: 0 all, 1 rs485, 2 can, 3 i2c, 4 spi
 };
 uint8_t sub_get(uint32_t client);
 void sub_set(uint32_t client, uint8_t flags);

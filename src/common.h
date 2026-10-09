@@ -13,12 +13,23 @@ constexpr int RS485_RX = 18;
 constexpr int RS485_DE = 21;  // SP3485 DE+RE, driven by UART RTS in RS485 half-duplex mode
 constexpr int CAN_TX = 15;
 constexpr int CAN_RX = 16;
-constexpr int I2C_SDA = 39;
+constexpr int I2C_SDA = 39;  // on-board RTC bus (not broken out)
 constexpr int I2C_SCL = 38;
+// Expansion buses
+constexpr int QWIIC_SDA = 2;  // SH1.0 connector beside USB-C: GND, 3V3, SDA, SCL
+constexpr int QWIIC_SCL = 1;
+constexpr int HDR_SDA = 8;    // 2x10 pin header (inside the case)
+constexpr int HDR_SCL = 9;
+constexpr int SPI_SCK = 12;   // FSPI IO_MUX pins
+constexpr int SPI_MOSI = 11;
+constexpr int SPI_MISO = 13;
+constexpr int SPI_CS = 10;
 }  // namespace pins
 
-enum Bus : uint8_t { BUS_RS485 = 0, BUS_CAN = 1 };
-enum Proto : uint8_t { PROTO_MODBUS = 0, PROTO_CANOPEN = 1, PROTO_J1939 = 2 };
+enum Bus : uint8_t { BUS_RS485 = 0, BUS_CAN = 1, BUS_QWIIC = 2, BUS_I2C = 3, BUS_SPI = 4 };
+constexpr uint8_t BUS_COUNT = 5;
+enum Proto : uint8_t { PROTO_MODBUS = 0, PROTO_CANOPEN = 1, PROTO_J1939 = 2, PROTO_I2C = 3, PROTO_SPI = 4 };
+inline bool bus_is_i2c(uint8_t bus) { return bus == BUS_QWIIC || bus == BUS_I2C; }
 
 const char *bus_name(uint8_t bus);
 const char *proto_name(uint8_t proto);

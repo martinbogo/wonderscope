@@ -10,7 +10,7 @@ static TraceFrame *ring;
 static uint32_t head;  // seq of next frame
 static SemaphoreHandle_t mtx;
 
-BusCounters g_counters[2];
+BusCounters g_counters[BUS_COUNT];
 
 void trace_init() {
   ring = (TraceFrame *)heap_caps_calloc(TRACE_SLOTS, sizeof(TraceFrame), MALLOC_CAP_SPIRAM);
@@ -18,7 +18,7 @@ void trace_init() {
 }
 
 void trace_add(uint8_t bus, uint8_t dir, uint8_t flags, uint32_t id, const uint8_t *data, size_t len) {
-  if (bus < 2) {
+  if (bus < BUS_COUNT) {
     if (dir == DIR_TX) g_counters[bus].tx++;
     else g_counters[bus].rx++;
     if (flags & TF_ERR) g_counters[bus].err++;

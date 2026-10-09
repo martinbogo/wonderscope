@@ -10,10 +10,10 @@ constexpr int MAX_PGNS = 32;
 
 struct WatchItem {
   char name[24];
-  uint8_t fn;     // Modbus: 1 coils, 2 discrete, 3 holding, 4 input. CANopen: 0 (SDO)
-  uint16_t addr;  // Modbus start address, or CANopen object index
-  uint8_t sub;    // CANopen sub-index
-  uint8_t count;  // Modbus quantity (registers 1..8 / bits 1..64)
+  uint8_t fn;     // Modbus: 1 coils, 2 discrete, 3 holding, 4 input. CANopen, I2C, SPI: 0
+  uint16_t addr;  // Modbus start address, CANopen object index, I2C/SPI register
+  uint8_t sub;    // CANopen sub-index; I2C register address width in bytes (1 or 2)
+  uint8_t count;  // Modbus quantity (registers 1..8 / bits 1..64); I2C/SPI bytes (1..16)
   char fmt[8];    // display format; interpreted by the UI (u16,s16,u32,s32,f32,hex,bool,str)
   float scale;
   char unit[8];
@@ -31,6 +31,13 @@ struct PgnEntry {
   uint32_t lastMs;
   uint8_t len;
   uint8_t data[8];
+};
+
+constexpr int MAX_VALUES = 8;
+struct DevValue {
+  char name[16];
+  char unit[8];
+  float v;
 };
 
 struct Device {
@@ -65,6 +72,12 @@ struct Device {
   // J1939 PGNs seen from this source address
   PgnEntry *pgns;
   uint8_t nPgns;
+  // I2C decoding driver and its latest values
+  char driver[12];
+  DevValue vals[MAX_VALUES];
+  uint8_t nVals;
+  uint32_t valsTs;
+  int16_t valsErr;
 };
 
 void dev_init();
@@ -97,8 +110,10 @@ struct PollTask {
   uint8_t parity, stop;
   uint8_t nWatch;
   WatchItem watch[MAX_WATCH];
+  char driver[12];
 };
 bool dev_next_poll(uint8_t bus, uint32_t nowMs, PollTask &out);
+void dev_set_values(uint8_t bus, uint8_t proto, uint8_t addr, const DevValue *vals, uint8_t n, int16_t err);
 void dev_set_watch_value(uint8_t bus, uint8_t proto, uint8_t addr, uint8_t idx, const uint8_t *raw, uint8_t len,
                          int16_t err, uint32_t abortCode);
 

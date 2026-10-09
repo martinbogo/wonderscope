@@ -2,7 +2,8 @@
 <!-- Dashboard with a simulated backend: serve the project root and open /tools/mock/
      Query parameters (for screenshots):
        view=map|grid|traffic|ids|console|settings  theme=light|dark
-       open=<device key>  tab=<panel tab label>  cmds=<console commands, ';'-separated> -->
+       open=<device key>  tab=<panel tab label>  cmds=<console commands, ';'-separated>
+       scroll=<bus card id>  chart=<ms delay before opening the first trend graph> -->
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -34,6 +35,13 @@
       await sleep(400);
       const tab = q.get('tab');
       if (tab) { const b = [...document.querySelectorAll('.dtabs button')].find(b => b.textContent === tab); if (b) b.click(); }
+    }
+    const scroll = q.get('scroll');
+    if (scroll) { await sleep(300); const el = document.getElementById('buscard-' + scroll); if (el) el.scrollIntoView(); }
+    if (q.get('chart')) {
+      await sleep(+q.get('chart'));
+      const b = document.querySelector('#dValues .spark-btn, #dWatchValues .spark-btn');
+      if (b) b.click();
     }
     const cmds = q.get('cmds');
     if (cmds) {
