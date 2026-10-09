@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.ref_name }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check tag matches FW_VERSION
+        run: |
+          fw=$(sed -n 's/^#define FW_VERSION "\(.*\)"/\1/p' src/common.h)
+          echo "FW_VERSION=$fw tag=$TAG"
+          test "v$fw" = "$TAG" || { echo "::error::Tag $TAG does not match FW_VERSION $fw in src/common.h"; exit 1; }
+          echo "VERSION=$fw" >> "$GITHUB_ENV"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.platformio
+            ~/.cache/pip
+          key: pio-${{ runner.os }}-${{ hashFiles('platformio.ini') }}
+
+      - name: Install PlatformIO
+        run: pip install --upgrade platformio
+
+      - name: Build
+        run: pio run -e wonderscope
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p dist
+          cp .pio/build/wonderscope/firmware.factory.bin "dist/wonderscope-$VERSION-factory.bin"
+          cp .pio/build/wonderscope/firmware.bin "dist/wonderscope-$VERSION-ota.bin"
+          (cd dist && sha256sum *.bin > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Release notes
+        run: |
+          git fetch --force origin "refs/tags/$TAG:refs/tags/$TAG"
+          git for-each-ref "refs/tags/$TAG" --format='%(contents)' > notes.md
+          cat >> notes.md <<EOF
+
+          ### Binaries
+          - \`wonderscope-$VERSION-factory.bin\`: complete image, written over USB at offset 0
+            (\`python -m esptool --chip esp32s3 write-flash 0 wonderscope-$VERSION-factory.bin\`)
+          - \`wonderscope-$VERSION-ota.bin\`: update for a board running WonderScope (Settings → Firmware)
+          - \`SHA256SUMS\`: checksums
+          EOF
+          cat notes.md
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* --title "WonderScope $VERSION" --notes-file notes.md --verify-tag
+          fi
